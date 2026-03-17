@@ -10,11 +10,15 @@ Use these values when creating the public repository.
 
 Local Windows web GUI for glmocr with selfhosted and maas modes.
 
+## Website
+
+Leave this blank unless you have a public demo URL.
+
 ## About / Long Description
 
 `GLM OCR Studio` is a Windows-first OCR interface built around the `glmocr` SDK.
-It focuses on the web GUI as the main entry point and includes a lightweight
-desktop launcher for convenience.
+The web GUI is the main entry point. A lightweight desktop launcher is included
+for convenience, but it is secondary.
 
 The project supports:
 
