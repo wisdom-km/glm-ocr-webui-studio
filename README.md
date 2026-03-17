@@ -1,6 +1,6 @@
 # GLM OCR Studio
 
-Local Windows GUI for `glmocr`, with both desktop and web entry points.
+Local Windows web GUI for `glmocr`, with an optional desktop launcher.
 
 This repository is a Codex-assisted derivative of the open-source
 [`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI) project.
@@ -15,6 +15,12 @@ installed in this environment.
 - Real-time progress and ETA
 - Automatic backend status refresh
 - Optional layout analysis export
+
+## Recommended UI
+
+Use the web GUI first. It is the most polished and the main entry point for this repository.
+
+The desktop GUI is still included for convenience, but it is secondary and less optimized.
 
 ## Files
 
@@ -50,6 +56,7 @@ launch_glm_ocr_desktop.bat
 - `selfhosted` mode does not need an API key.
 - API fields are hidden unless `maas` is selected.
 - Output and cache folders are ignored by Git.
+- The web GUI is the primary interface; the desktop GUI is kept as a fallback.
 
 ## Credits
 
