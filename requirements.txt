@@ -1,0 +1,11 @@
+glmocr==0.1.3
+gradio>=6.0
+pypdfium2
+requests
+fastapi
+uvicorn
+sentencepiece
+protobuf
+pillow
+torch
+transformers
