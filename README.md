@@ -1,15 +1,22 @@
 # GLM OCR Studio
 
-Local Windows web GUI for `glmocr`, with an optional desktop launcher.
+Windows-first OCR studio for `glmocr`.
 
-Chinese README: [README_zh.md](README_zh.md)
+The web GUI is the primary entry point. The desktop launcher is kept as a
+secondary fallback.
 
-This repository is a Codex-assisted derivative of the open-source
-[`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI) project.
-It was adapted for a local Windows workflow and for the `glmocr` SDK already
-installed in this environment.
+If you prefer Chinese, open [README_zh.md](README_zh.md).
 
-## Features
+## Overview
+
+This repository packages a local Windows OCR workflow around the installed
+`glmocr` SDK.
+
+It is a Codex-assisted derivative of
+[`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI) and is
+adapted for local use on Windows.
+
+## Highlights
 
 - `selfhosted` mode with automatic local backend startup
 - `maas` mode for API-key-based cloud use
@@ -17,32 +24,16 @@ installed in this environment.
 - Real-time progress and ETA
 - Automatic backend status refresh
 - Optional layout analysis export
+- Web GUI as the recommended interface
 
-## Recommended UI
-
-Use the web GUI first. It is the most polished and the main entry point for this repository.
-
-The desktop GUI is still included for convenience, but it is secondary and less optimized.
-
-## Files
-
-- `glm_ocr_web_gui.py` - web UI
-- `glm_ocr_local_gui.py` - desktop UI
-- `glm_ocr_local_server.py` - local OCR backend
-- `launch_glm_ocr_desktop.bat` - one-click launcher
-- `launch_glm_ocr_web_gui.bat` - web UI launcher
-- `launch_glm_ocr_local_server.bat` - backend launcher
-
-## Usage
-
-Web UI:
+## Quick Start
 
 ```powershell
 conda activate glm-ocr
 python .\glm_ocr_web_gui.py
 ```
 
-Desktop UI:
+If you want the desktop fallback:
 
 ```powershell
 conda activate glm-ocr
@@ -55,11 +46,39 @@ One-click launcher:
 launch_glm_ocr_desktop.bat
 ```
 
-The launcher will try `conda run -n glm-ocr python` first, then fall back to
-`py -3` or `python` on your PATH.
+The launcher tries `conda run -n glm-ocr python` first, then falls back to
+`py -3`, then `python`.
 
-If you are not using Conda, replace the `python` command with the Python
-executable from your own environment.
+## How It Works
+
+1. Choose `selfhosted` for local OCR.
+2. The web UI starts the local backend automatically if port `5002` is not up.
+3. Upload an image or PDF.
+4. The app writes Markdown and JSON outputs into the configured output folder.
+
+`maas` is available only when you want API-key-based remote usage.
+
+## Files
+
+- `glm_ocr_web_gui.py` - web UI
+- `glm_ocr_local_gui.py` - desktop UI
+- `glm_ocr_local_server.py` - local OCR backend
+- `launch_glm_ocr_desktop.bat` - one-click launcher
+- `launch_glm_ocr_web_gui.bat` - web UI launcher
+- `launch_glm_ocr_local_server.bat` - backend launcher
+
+## Output
+
+By default, outputs are written under the repository-local output folders:
+
+- `glm_ocr_outputs`
+- `glm_ocr_outputs_web`
+
+Typical exports include:
+
+- Markdown
+- JSON
+- Optional layout analysis artifacts
 
 ## Notes
 
@@ -68,8 +87,10 @@ executable from your own environment.
 - Output and cache folders are ignored by Git.
 - The web GUI is the primary interface; the desktop GUI is kept as a fallback.
 
-## Credits
+## Attribution
 
 - Based on [`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI)
 - Built and adapted with Codex
 - Based on the `glmocr` SDK
+- README structure and publishing flow were inspired by
+  [`wisdom-km/LYRIC-SYNC`](https://github.com/wisdom-km/LYRIC-SYNC)
