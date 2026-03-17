@@ -1,19 +1,14 @@
 @echo off
 setlocal
 
-set "PYTHON_EXE=G:\BaseWare\Anaconda\envs\glm-ocr\python.exe"
-if not exist "%PYTHON_EXE%" (
-    echo Python executable not found: %PYTHON_EXE%
-    echo Please edit launch_glm_ocr_desktop.bat to point to your glm-ocr environment.
-    pause
-    exit /b 1
-)
-
 set "ROOT=%~dp0"
 set "SERVER_LOG=%ROOT%glm_ocr_server.log"
 
+call :resolve_python
+if errorlevel 1 exit /b 1
+
 echo Starting local GLM-OCR server...
-start "GLM-OCR Local Server" /min cmd /c ""%PYTHON_EXE%" "%ROOT%glm_ocr_local_server.py" > "%SERVER_LOG%" 2>&1"
+start "GLM-OCR Local Server" /min cmd /c %PYTHON_CMD% "%ROOT%glm_ocr_local_server.py" ^> "%SERVER_LOG%" 2^>^&1
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$url='http://127.0.0.1:5002/health';" ^
@@ -29,6 +24,30 @@ if errorlevel 1 (
 )
 
 echo Starting web GUI...
-start "GLM-OCR Web GUI" "%PYTHON_EXE%" "%ROOT%glm_ocr_web_gui.py"
+start "GLM-OCR Web GUI" %PYTHON_CMD% "%ROOT%glm_ocr_web_gui.py"
 
 endlocal
+exit /b 0
+
+:resolve_python
+where conda >nul 2>nul
+if not errorlevel 1 (
+    set "PYTHON_CMD=conda run -n glm-ocr python"
+    exit /b 0
+)
+
+where py >nul 2>nul
+if not errorlevel 1 (
+    set "PYTHON_CMD=py -3"
+    exit /b 0
+)
+
+where python >nul 2>nul
+if not errorlevel 1 (
+    set "PYTHON_CMD=python"
+    exit /b 0
+)
+
+echo Python not found. Install Python or Conda and make sure it is on PATH.
+pause
+exit /b 1

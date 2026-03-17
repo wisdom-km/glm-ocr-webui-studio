@@ -53,6 +53,9 @@ One-click launcher:
 launch_glm_ocr_desktop.bat
 ```
 
+The launcher will try `conda run -n glm-ocr python` first, then fall back to
+`py -3` or `python` on your PATH.
+
 If you are not using Conda, replace the `python` command with the Python
 executable from your own environment.
 

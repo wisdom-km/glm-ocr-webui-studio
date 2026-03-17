@@ -1,15 +1,35 @@
 @echo off
 setlocal
 
-set "PYTHON_EXE=G:\BaseWare\Anaconda\envs\glm-ocr\python.exe"
-if not exist "%PYTHON_EXE%" (
-    echo Python executable not found: %PYTHON_EXE%
-    pause
-    exit /b 1
-)
+call :resolve_python
+if errorlevel 1 exit /b 1
 
 pushd "%~dp0"
-"%PYTHON_EXE%" "%~dp0glm_ocr_local_server.py"
+%PYTHON_CMD% "%~dp0glm_ocr_local_server.py"
 popd
 
 endlocal
+exit /b 0
+
+:resolve_python
+where conda >nul 2>nul
+if not errorlevel 1 (
+    set "PYTHON_CMD=conda run -n glm-ocr python"
+    exit /b 0
+)
+
+where py >nul 2>nul
+if not errorlevel 1 (
+    set "PYTHON_CMD=py -3"
+    exit /b 0
+)
+
+where python >nul 2>nul
+if not errorlevel 1 (
+    set "PYTHON_CMD=python"
+    exit /b 0
+)
+
+echo Python not found. Install Python or Conda and make sure it is on PATH.
+pause
+exit /b 1
