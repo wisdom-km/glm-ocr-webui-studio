@@ -2,6 +2,8 @@
 
 Local Windows web GUI for `glmocr`, with an optional desktop launcher.
 
+Chinese README: [README_zh.md](README_zh.md)
+
 This repository is a Codex-assisted derivative of the open-source
 [`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI) project.
 It was adapted for a local Windows workflow and for the `glmocr` SDK already
