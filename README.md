@@ -36,13 +36,15 @@ The desktop GUI is still included for convenience, but it is secondary and less 
 Web UI:
 
 ```powershell
-G:\BaseWare\Anaconda\envs\glm-ocr\python.exe .\glm_ocr_web_gui.py
+conda activate glm-ocr
+python .\glm_ocr_web_gui.py
 ```
 
 Desktop UI:
 
 ```powershell
-G:\BaseWare\Anaconda\envs\glm-ocr\python.exe .\glm_ocr_local_gui.py
+conda activate glm-ocr
+python .\glm_ocr_local_gui.py
 ```
 
 One-click launcher:
@@ -50,6 +52,9 @@ One-click launcher:
 ```bat
 launch_glm_ocr_desktop.bat
 ```
+
+If you are not using Conda, replace the `python` command with the Python
+executable from your own environment.
 
 ## Notes
 
