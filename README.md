@@ -2,6 +2,11 @@
 
 Windows desktop and web UI for `glmocr`.
 
+This project is a Codex-assisted derivative of the open-source
+[`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI) project.
+It was adapted for a local Windows workflow and for the `glmocr` SDK already
+installed in this environment.
+
 ## Features
 
 - Local `selfhosted` mode with automatic startup
@@ -48,5 +53,7 @@ launch_glm_ocr_desktop.bat
 
 ## Credits
 
+- Based on [`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI)
+- Built and adapted with Codex
 - Based on the `glmocr` SDK
 - UI adapted for a local Windows workflow
