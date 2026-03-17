@@ -4,7 +4,6 @@
 
 当前主入口是 Web GUI，桌面启动器作为备用入口保留。
 
-如果你更习惯中文，请看 [README_zh.md](README_zh.md)。
 
 ## 概览
 
