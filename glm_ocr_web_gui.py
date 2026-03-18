@@ -44,16 +44,35 @@ def normalize_file_path(file_obj: Any) -> str:
         return ""
     if isinstance(file_obj, str):
         return file_obj
-    if hasattr(file_obj, "path") and getattr(file_obj, "path"):
-        return str(file_obj.path)
-    if hasattr(file_obj, "name"):
-        return str(file_obj.name)
+
+    candidates: list[str] = []
+    for attr in ("path", "name", "orig_name"):
+        if hasattr(file_obj, attr):
+            value = getattr(file_obj, attr)
+            if value:
+                candidates.append(str(value))
+
     if isinstance(file_obj, dict):
-        for key in ("path", "name"):
+        for key in ("path", "name", "orig_name"):
             value = file_obj.get(key)
             if value:
-                return str(value)
-    raise ValueError(f"Unsupported upload payload: {type(file_obj)!r}")
+                candidates.append(str(value))
+
+    seen = set()
+    normalized_candidates = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized_candidates.append(candidate)
+
+    if not normalized_candidates:
+        raise ValueError(f"Unsupported upload payload: {type(file_obj)!r}")
+
+    for candidate in normalized_candidates:
+        if Path(candidate).expanduser().exists():
+            return candidate
+    return normalized_candidates[0]
 
 
 def parse_optional_int(value: str | None, label: str) -> int | None:
@@ -79,8 +98,6 @@ def collect_paths(files: list[Any] | None) -> list[str]:
     for file_obj in files:
         raw_path = normalize_file_path(file_obj)
         path = Path(raw_path).expanduser().resolve()
-        if not path.exists():
-            raise gr.Error(f"上传文件不存在，请重新选择文件: {raw_path}")
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
         normalized.append(str(path))
@@ -362,23 +379,31 @@ def run_ocr(
     end_page: str,
     progress=gr.Progress(track_tqdm=False),
 ):
-    paths = collect_paths(files)
-    workload = estimate_units(paths)
-    output_root = Path(output_dir.strip() or DEFAULT_OUTPUT_DIR).resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
+    try:
+        paths = collect_paths(files)
+        workload = estimate_units(paths)
+        output_root = Path(output_dir.strip() or DEFAULT_OUTPUT_DIR).resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
 
-    if (
-        mode == "maas"
-        and not api_key.strip()
-        and not env_file.strip()
-        and not os.environ.get("GLMOCR_API_KEY")
-    ):
-        raise gr.Error("MaaS 模式需要 API Key。请填写 API Key、设置环境变量，或提供 .env 文件。")
+        if (
+            mode == "maas"
+            and not api_key.strip()
+            and not env_file.strip()
+            and not os.environ.get("GLMOCR_API_KEY")
+        ):
+            raise gr.Error("MaaS 模式需要 API Key。请填写 API Key、设置环境变量，或提供 .env 文件。")
 
-    start_page_id = parse_optional_int(start_page, "PDF 起始页")
-    end_page_id = parse_optional_int(end_page, "PDF 结束页")
-    if start_page_id and end_page_id and start_page_id > end_page_id:
-        raise gr.Error("PDF 起始页不能大于结束页。")
+        start_page_id = parse_optional_int(start_page, "PDF 起始页")
+        end_page_id = parse_optional_int(end_page, "PDF 结束页")
+        if start_page_id and end_page_id and start_page_id > end_page_id:
+            raise gr.Error("PDF 起始页不能大于结束页。")
+    except Exception as exc:
+        tb = traceback.format_exc()
+        append_app_log(tb)
+        error_msg = f"{type(exc).__name__}: {exc}"
+        progress_html = render_progress("错误", 0.0, "预计剩余时间: 计算中")
+        yield f"错误: {error_msg}", "", "", tb, [], progress_html
+        return
 
     parser_kwargs: dict[str, Any] = {
         "config_path": config_path.strip() or None,
