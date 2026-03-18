@@ -88,7 +88,7 @@ Typical exports include:
 - The web GUI is the primary interface; the desktop GUI is kept as a fallback.
 
 ## Attribution
-
+- Base model: zai-org/GLM-OCR
 - Based on [`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI)
 - Built and adapted with Codex
 - Based on the `glmocr` SDK
