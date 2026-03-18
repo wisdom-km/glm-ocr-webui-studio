@@ -8,6 +8,7 @@ __pycache__/
 glm_ocr_outputs/
 glm_ocr_outputs_web/
 hf-cache/
+.staging_inputs/
 
 # Local helpers
 GLM-OCR Desktop.lnk

@@ -1,9 +1,11 @@
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 import traceback
@@ -22,6 +24,7 @@ from glmocr.maas_client import MissingApiKeyError
 APP_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = APP_ROOT / "glm_ocr_outputs_web"
 APP_LOG_FILE = APP_ROOT / "glm_ocr_web_gui.log"
+STAGING_ROOT = Path(tempfile.gettempdir()) / "glmocr_staging"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".pdf"}
 SELFHOSTED_HOST = "127.0.0.1"
 SELFHOSTED_PORT = 5002
@@ -75,10 +78,16 @@ def normalize_file_path(file_obj: Any) -> str:
     return normalized_candidates[0]
 
 
-def parse_optional_int(value: str | None, label: str) -> int | None:
+def normalize_optional_text(value: Any) -> str:
     if value is None:
-        return None
-    value = value.strip()
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def parse_optional_int(value: str | None, label: str) -> int | None:
+    value = normalize_optional_text(value)
     if not value:
         return None
     try:
@@ -100,6 +109,8 @@ def collect_paths(files: list[Any] | None) -> list[str]:
         path = Path(raw_path).expanduser().resolve()
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
+        if not path.exists():
+            raise gr.Error(f"上传文件不存在或无法访问: {raw_path}")
         normalized.append(str(path))
 
     if not normalized:
@@ -135,6 +146,33 @@ def append_app_log(message: str) -> None:
     APP_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with APP_LOG_FILE.open("a", encoding="utf-8") as handle:
         handle.write(f"[{timestamp}] {message}\n")
+
+
+def needs_ascii_staging(file_path: str) -> bool:
+    return not file_path.isascii()
+
+
+def stage_input_for_parser(file_path: str, staging_dir: Path, index: int) -> str:
+    source = Path(file_path)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staged_name = f"input_{index}{source.suffix.lower()}"
+    staged_path = staging_dir / staged_name
+    staged_path.write_bytes(source.read_bytes())
+    return str(staged_path)
+
+
+def build_error_outputs(error_msg: str, traceback_text: str = "") -> tuple[str, str, str, str, list[str], str]:
+    progress_html = render_progress("错误", 0.0, "预计剩余时间: 计算中")
+    json_text = json.dumps(
+        {
+            "error": error_msg,
+            "traceback": traceback_text or None,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    logs_text = traceback_text or error_msg
+    return f"错误: {error_msg}", "", json_text, logs_text, [], progress_html
 
 
 def format_eta(seconds: float | None) -> str:
@@ -380,201 +418,243 @@ def run_ocr(
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
+        append_app_log("run_ocr precheck start")
+        api_key_text = normalize_optional_text(api_key)
+        env_file_text = normalize_optional_text(env_file)
+        config_path_text = normalize_optional_text(config_path)
+        output_dir_text = normalize_optional_text(output_dir)
+        start_page_text = normalize_optional_text(start_page)
+        end_page_text = normalize_optional_text(end_page)
+
         paths = collect_paths(files)
         workload = estimate_units(paths)
-        output_root = Path(output_dir.strip() or DEFAULT_OUTPUT_DIR).resolve()
+        output_root = Path(output_dir_text or DEFAULT_OUTPUT_DIR).resolve()
         output_root.mkdir(parents=True, exist_ok=True)
 
         if (
             mode == "maas"
-            and not api_key.strip()
-            and not env_file.strip()
+            and not api_key_text
+            and not env_file_text
             and not os.environ.get("GLMOCR_API_KEY")
         ):
             raise gr.Error("MaaS 模式需要 API Key。请填写 API Key、设置环境变量，或提供 .env 文件。")
 
-        start_page_id = parse_optional_int(start_page, "PDF 起始页")
-        end_page_id = parse_optional_int(end_page, "PDF 结束页")
+        start_page_id = parse_optional_int(start_page_text, "PDF 起始页")
+        end_page_id = parse_optional_int(end_page_text, "PDF 结束页")
         if start_page_id and end_page_id and start_page_id > end_page_id:
             raise gr.Error("PDF 起始页不能大于结束页。")
     except Exception as exc:
         tb = traceback.format_exc()
         append_app_log(tb)
         error_msg = f"{type(exc).__name__}: {exc}"
-        progress_html = render_progress("错误", 0.0, "预计剩余时间: 计算中")
-        yield f"错误: {error_msg}", "", "", tb, [], progress_html
+        yield build_error_outputs(error_msg, tb)
         return
 
-    parser_kwargs: dict[str, Any] = {
-        "config_path": config_path.strip() or None,
-        "mode": mode,
-        "env_file": env_file.strip() or None,
-    }
-    if mode == "maas" and api_key.strip():
-        parser_kwargs["api_key"] = api_key.strip()
+    try:
+        parser_kwargs: dict[str, Any] = {
+            "config_path": config_path_text or None,
+            "mode": mode,
+            "env_file": env_file_text or None,
+        }
+        if mode == "maas" and api_key_text:
+            parser_kwargs["api_key"] = api_key_text
 
-    event_queue: queue.Queue = queue.Queue()
-    state = {
-        "summaries": [],
-        "markdown_parts": [],
-        "json_payloads": [],
-        "log_lines": [],
-        "download_paths": [],
-        "error": None,
-        "done": False,
-    }
+        event_queue: queue.Queue = queue.Queue()
+        state = {
+            "summaries": [],
+            "markdown_parts": [],
+            "json_payloads": [],
+            "log_lines": [],
+            "download_paths": [],
+            "error": None,
+            "done": False,
+        }
 
-    def worker() -> None:
-        try:
-            if mode == "selfhosted":
-                ensure_selfhosted_server(progress)
-                parser_kwargs["ocr_api_host"] = SELFHOSTED_HOST
-                parser_kwargs["ocr_api_port"] = SELFHOSTED_PORT
-
-            total = len(paths)
-            append_app_log(f"run_ocr start mode={mode} files={len(paths)} output={output_root}")
-            with GlmOcr(**parser_kwargs) as parser:
-                for index, file_path in enumerate(paths, start=1):
-                    event_queue.put(
-                        {
-                            "type": "file_start",
-                            "index": index,
-                            "total": total,
-                            "file_path": file_path,
-                            "label": Path(file_path).name,
-                        }
-                    )
-
-                    parse_kwargs = {
-                        "save_layout_visualization": save_layout_visualization,
-                    }
-                    if mode == "maas":
-                        if start_page_id is not None:
-                            parse_kwargs["start_page_id"] = start_page_id
-                        if end_page_id is not None:
-                            parse_kwargs["end_page_id"] = end_page_id
-
-                    result = parser.parse(file_path, **parse_kwargs)
-                    result.save(
-                        output_dir=output_root,
-                        save_layout_visualization=save_layout_visualization,
-                    )
-
-                    saved_dir = output_root / Path(file_path).stem
-                    result_dict = result.to_dict()
-                    state["summaries"].append(build_summary(file_path, saved_dir, result_dict))
-                    state["markdown_parts"].append(
-                        f"# {Path(file_path).name}\n\n{result.markdown_result or ''}".strip()
-                    )
-                    state["json_payloads"].append(
-                        {
-                            "input_file": file_path,
-                            "saved_dir": str(saved_dir),
-                            "result": result_dict,
-                        }
-                    )
-                    state["log_lines"].append(f"[{index}/{total}] 完成，输出目录 {saved_dir}")
-
-                    if saved_dir.exists():
-                        for child in sorted(saved_dir.rglob("*")):
-                            if child.is_file():
-                                state["download_paths"].append(str(child))
-
-                    event_queue.put(
-                        {
-                            "type": "file_done",
-                            "index": index,
-                            "total": total,
-                            "file_path": file_path,
-                            "saved_dir": str(saved_dir),
-                        }
-                    )
-            append_app_log("run_ocr finished successfully")
-        except MissingApiKeyError as exc:
-            state["error"] = f"缺少 API Key: {exc}"
-            state["log_lines"].append(traceback.format_exc())
-            append_app_log(traceback.format_exc())
-        except Exception as exc:
-            state["error"] = f"{type(exc).__name__}: {exc}"
-            tb = traceback.format_exc()
-            state["log_lines"].append(tb)
-            append_app_log(tb)
-        finally:
-            state["done"] = True
-            event_queue.put({"type": "done"})
-
-    worker_thread = threading.Thread(target=worker, daemon=True)
-    worker_thread.start()
-
-    total_units = sum(units for _, units in workload)
-    completed_units = 0.0
-    total_elapsed_start = time.time()
-    current_label = "初始化"
-    total_units = max(1.0, float(total_units))
-
-    initial_progress = render_progress("初始化", 0.0, "预计剩余时间: 计算中")
-    yield "", "", "", "", [], initial_progress
-
-    while True:
-        while True:
+        def worker() -> None:
+            staging_dir: Path | None = None
             try:
-                event = event_queue.get_nowait()
-            except queue.Empty:
+                if mode == "selfhosted":
+                    append_app_log("selfhosted preflight start")
+                    ensure_selfhosted_server(progress)
+                    parser_kwargs["ocr_api_host"] = SELFHOSTED_HOST
+                    parser_kwargs["ocr_api_port"] = SELFHOSTED_PORT
+
+                total = len(paths)
+                append_app_log(f"run_ocr start mode={mode} files={len(paths)} output={output_root}")
+                parser_inputs: list[tuple[str, str]] = []
+                if mode == "selfhosted":
+                    STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+                    staging_dir = Path(tempfile.mkdtemp(prefix="job_", dir=str(STAGING_ROOT)))
+                    append_app_log(f"staging dir created {staging_dir}")
+
+                for index, file_path in enumerate(paths, start=1):
+                    parser_input_path = file_path
+                    if mode == "selfhosted" and staging_dir is not None and needs_ascii_staging(file_path):
+                        parser_input_path = stage_input_for_parser(file_path, staging_dir, index)
+                        state["log_lines"].append(
+                            f"[{index}/{total}] 检测到非 ASCII 路径，已使用临时英文文件名处理"
+                        )
+                        append_app_log(
+                            f"staged input original={file_path} staged={parser_input_path}"
+                        )
+                    parser_inputs.append((file_path, parser_input_path))
+
+                append_app_log("parser creation start")
+                with GlmOcr(**parser_kwargs) as parser:
+                    append_app_log("parser creation done")
+                    for index, (file_path, parser_input_path) in enumerate(parser_inputs, start=1):
+                        event_queue.put(
+                            {
+                                "type": "file_start",
+                                "index": index,
+                                "total": total,
+                                "file_path": file_path,
+                                "label": Path(file_path).name,
+                            }
+                        )
+                        append_app_log(f"parse start file={file_path} parser_input={parser_input_path}")
+
+                        parse_kwargs = {
+                            "save_layout_visualization": save_layout_visualization,
+                        }
+                        if mode == "maas":
+                            if start_page_id is not None:
+                                parse_kwargs["start_page_id"] = start_page_id
+                            if end_page_id is not None:
+                                parse_kwargs["end_page_id"] = end_page_id
+
+                        result = parser.parse(parser_input_path, **parse_kwargs)
+                        if getattr(result, "original_images", None):
+                            result.original_images = [file_path]
+
+                        append_app_log(f"result save start file={file_path}")
+                        result.save(
+                            output_dir=output_root,
+                            save_layout_visualization=save_layout_visualization,
+                        )
+
+                        saved_dir = output_root / Path(file_path).stem
+                        result_dict = result.to_dict()
+                        state["summaries"].append(build_summary(file_path, saved_dir, result_dict))
+                        state["markdown_parts"].append(
+                            f"# {Path(file_path).name}\n\n{result.markdown_result or ''}".strip()
+                        )
+                        state["json_payloads"].append(
+                            {
+                                "input_file": file_path,
+                                "saved_dir": str(saved_dir),
+                                "result": result_dict,
+                            }
+                        )
+                        state["log_lines"].append(f"[{index}/{total}] 完成，输出目录 {saved_dir}")
+
+                        if saved_dir.exists():
+                            for child in sorted(saved_dir.rglob("*")):
+                                if child.is_file():
+                                    state["download_paths"].append(str(child))
+
+                        event_queue.put(
+                            {
+                                "type": "file_done",
+                                "index": index,
+                                "total": total,
+                                "file_path": file_path,
+                                "saved_dir": str(saved_dir),
+                            }
+                        )
+                append_app_log("run_ocr finished successfully")
+            except MissingApiKeyError as exc:
+                state["error"] = f"缺少 API Key: {exc}"
+                tb = traceback.format_exc()
+                state["log_lines"].append(tb)
+                append_app_log(tb)
+            except Exception as exc:
+                state["error"] = f"{type(exc).__name__}: {exc}"
+                tb = traceback.format_exc()
+                state["log_lines"].append(tb)
+                append_app_log(tb)
+            finally:
+                if staging_dir is not None:
+                    try:
+                        shutil.rmtree(staging_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                state["done"] = True
+                event_queue.put({"type": "done"})
+
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+
+        total_units = sum(units for _, units in workload)
+        completed_units = 0.0
+        total_elapsed_start = time.time()
+        current_label = "初始化"
+        total_units = max(1.0, float(total_units))
+
+        initial_progress = render_progress("初始化", 0.0, "预计剩余时间: 计算中")
+        yield "", "", "", "", [], initial_progress
+
+        while True:
+            while True:
+                try:
+                    event = event_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                if event["type"] == "file_start":
+                    current_label = f"处理 {event['label']}"
+                    state["log_lines"].append(
+                        f"[{event['index']}/{event['total']}] 开始处理 {event['file_path']}"
+                    )
+                elif event["type"] == "file_done":
+                    completed_units += workload[event["index"] - 1][1]
+                    current_label = f"完成 {event['index']}/{event['total']}"
+                elif event["type"] == "done":
+                    pass
+
+            elapsed = time.time() - total_elapsed_start
+            if completed_units > 0:
+                avg_seconds_per_unit = elapsed / completed_units
+                remaining_units = max(0.0, total_units - completed_units)
+                eta_seconds = remaining_units * avg_seconds_per_unit
+            else:
+                heuristic_per_unit = 5.0 if mode == "selfhosted" else 3.0
+                eta_seconds = total_units * heuristic_per_unit
+
+            if not state["done"]:
+                smoothing_target = completed_units
+                if completed_units < total_units:
+                    elapsed_units = min(total_units, max(completed_units, elapsed / max(eta_seconds, 1e-6) * total_units))
+                    smoothing_target = max(completed_units, elapsed_units)
+                display_percent = (smoothing_target / total_units) * 100.0
+                eta_text = format_eta(eta_seconds)
+                progress_html = render_progress(current_label, display_percent, eta_text)
+                summary_text = "\n\n" + ("\n" + ("-" * 60) + "\n\n").join(state["summaries"]) if state["summaries"] else ""
+                markdown_text = "\n\n".join(state["markdown_parts"])
+                json_text = json.dumps(state["json_payloads"], ensure_ascii=False, indent=2)
+                logs_text = "\n".join(state["log_lines"])
+                yield summary_text.strip(), markdown_text, json_text, logs_text, state["download_paths"], progress_html
+                time.sleep(0.8)
+                continue
+
+            if state["error"]:
+                yield build_error_outputs(
+                    state["error"],
+                    "\n".join(state["log_lines"] or [state["error"]]),
+                )
                 break
 
-            if event["type"] == "file_start":
-                current_label = f"处理 {event['label']}"
-                state["log_lines"].append(
-                    f"[{event['index']}/{event['total']}] 开始处理 {event['file_path']}"
-                )
-            elif event["type"] == "file_done":
-                completed_units += workload[event["index"] - 1][1]
-                current_label = f"完成 {event['index']}/{event['total']}"
-            elif event["type"] == "done":
-                pass
-
-        elapsed = time.time() - total_elapsed_start
-        if completed_units > 0:
-            avg_seconds_per_unit = elapsed / completed_units
-            remaining_units = max(0.0, total_units - completed_units)
-            eta_seconds = remaining_units * avg_seconds_per_unit
-        else:
-            heuristic_per_unit = 5.0 if mode == "selfhosted" else 3.0
-            eta_seconds = total_units * heuristic_per_unit
-
-        if not state["done"]:
-            # Move the bar smoothly toward the estimated completion point while a file is running.
-            smoothing_target = completed_units
-            if completed_units < total_units:
-                elapsed_units = min(total_units, max(completed_units, elapsed / max(eta_seconds, 1e-6) * total_units))
-                smoothing_target = max(completed_units, elapsed_units)
-            display_percent = (smoothing_target / total_units) * 100.0
-            eta_text = format_eta(eta_seconds)
-            progress_html = render_progress(current_label, display_percent, eta_text)
+            progress_html = render_progress("完成", 100.0, "预计剩余时间: 0 秒")
             summary_text = "\n\n" + ("\n" + ("-" * 60) + "\n\n").join(state["summaries"]) if state["summaries"] else ""
             markdown_text = "\n\n".join(state["markdown_parts"])
             json_text = json.dumps(state["json_payloads"], ensure_ascii=False, indent=2)
             logs_text = "\n".join(state["log_lines"])
             yield summary_text.strip(), markdown_text, json_text, logs_text, state["download_paths"], progress_html
-            time.sleep(0.8)
-            continue
-
-        if state["error"]:
-            progress_html = render_progress("错误", 0.0, "预计剩余时间: 计算中")
-            summary_text = f"错误: {state['error']}"
-            markdown_text = "\n\n".join(state["markdown_parts"])
-            json_text = json.dumps(state["json_payloads"], ensure_ascii=False, indent=2)
-            logs_text = "\n".join(state["log_lines"] or [state["error"]])
-            yield summary_text, markdown_text, json_text, logs_text, state["download_paths"], progress_html
             break
-
-        progress_html = render_progress("完成", 100.0, "预计剩余时间: 0 秒")
-        summary_text = "\n\n" + ("\n" + ("-" * 60) + "\n\n").join(state["summaries"]) if state["summaries"] else ""
-        markdown_text = "\n\n".join(state["markdown_parts"])
-        json_text = json.dumps(state["json_payloads"], ensure_ascii=False, indent=2)
-        logs_text = "\n".join(state["log_lines"])
-        yield summary_text.strip(), markdown_text, json_text, logs_text, state["download_paths"], progress_html
-        break
+    except Exception as exc:
+        tb = traceback.format_exc()
+        append_app_log(tb)
+        yield build_error_outputs(f"{type(exc).__name__}: {exc}", tb)
 
 
 def build_app() -> gr.Blocks:
