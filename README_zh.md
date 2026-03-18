@@ -88,5 +88,3 @@ launch_glm_ocr_desktop.bat
 - 基于 [`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI)
 - 使用 Codex 完成适配与重构
 - 基于 `glmocr` SDK
-- README 的结构和发布组织方式参考了
-  [`wisdom-km/LYRIC-SYNC`](https://github.com/wisdom-km/LYRIC-SYNC)
