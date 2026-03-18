@@ -21,6 +21,7 @@ from glmocr.maas_client import MissingApiKeyError
 
 APP_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = APP_ROOT / "glm_ocr_outputs_web"
+APP_LOG_FILE = APP_ROOT / "glm_ocr_web_gui.log"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".pdf"}
 SELFHOSTED_HOST = "127.0.0.1"
 SELFHOSTED_PORT = 5002
@@ -110,6 +111,13 @@ def estimate_units(paths: list[str]) -> list[tuple[str, int]]:
 
 def render_progress(label: str, percent: float, eta: str) -> str:
     return BAR_TEMPLATE.format(label=label, percent=max(0.0, min(100.0, percent)), eta=eta)
+
+
+def append_app_log(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    APP_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with APP_LOG_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] {message}\n")
 
 
 def format_eta(seconds: float | None) -> str:
@@ -399,6 +407,7 @@ def run_ocr(
                 parser_kwargs["ocr_api_port"] = SELFHOSTED_PORT
 
             total = len(paths)
+            append_app_log(f"run_ocr start mode={mode} files={len(paths)} output={output_root}")
             with GlmOcr(**parser_kwargs) as parser:
                 for index, file_path in enumerate(paths, start=1):
                     event_queue.put(
@@ -455,12 +464,16 @@ def run_ocr(
                             "saved_dir": str(saved_dir),
                         }
                     )
+            append_app_log("run_ocr finished successfully")
         except MissingApiKeyError as exc:
             state["error"] = f"缺少 API Key: {exc}"
             state["log_lines"].append(traceback.format_exc())
+            append_app_log(traceback.format_exc())
         except Exception as exc:
             state["error"] = f"{type(exc).__name__}: {exc}"
-            state["log_lines"].append(traceback.format_exc())
+            tb = traceback.format_exc()
+            state["log_lines"].append(tb)
+            append_app_log(tb)
         finally:
             state["done"] = True
             event_queue.put({"type": "done"})
@@ -522,7 +535,13 @@ def run_ocr(
             continue
 
         if state["error"]:
-            raise gr.Error(state["error"])
+            progress_html = render_progress("错误", 0.0, "预计剩余时间: 计算中")
+            summary_text = f"错误: {state['error']}"
+            markdown_text = "\n\n".join(state["markdown_parts"])
+            json_text = json.dumps(state["json_payloads"], ensure_ascii=False, indent=2)
+            logs_text = "\n".join(state["log_lines"] or [state["error"]])
+            yield summary_text, markdown_text, json_text, logs_text, state["download_paths"], progress_html
+            break
 
         progress_html = render_progress("完成", 100.0, "预计剩余时间: 0 秒")
         summary_text = "\n\n" + ("\n" + ("-" * 60) + "\n\n").join(state["summaries"]) if state["summaries"] else ""
