@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import threading
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -42,10 +43,12 @@ def normalize_file_path(file_obj: Any) -> str:
         return ""
     if isinstance(file_obj, str):
         return file_obj
+    if hasattr(file_obj, "path") and getattr(file_obj, "path"):
+        return str(file_obj.path)
     if hasattr(file_obj, "name"):
         return str(file_obj.name)
     if isinstance(file_obj, dict):
-        for key in ("name", "path"):
+        for key in ("path", "name"):
             value = file_obj.get(key)
             if value:
                 return str(value)
@@ -73,7 +76,10 @@ def collect_paths(files: list[Any] | None) -> list[str]:
 
     normalized = []
     for file_obj in files:
-        path = Path(normalize_file_path(file_obj)).resolve()
+        raw_path = normalize_file_path(file_obj)
+        path = Path(raw_path).expanduser().resolve()
+        if not path.exists():
+            raise gr.Error(f"上传文件不存在，请重新选择文件: {raw_path}")
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
         normalized.append(str(path))
@@ -451,8 +457,10 @@ def run_ocr(
                     )
         except MissingApiKeyError as exc:
             state["error"] = f"缺少 API Key: {exc}"
+            state["log_lines"].append(traceback.format_exc())
         except Exception as exc:
             state["error"] = f"{type(exc).__name__}: {exc}"
+            state["log_lines"].append(traceback.format_exc())
         finally:
             state["done"] = True
             event_queue.put({"type": "done"})
