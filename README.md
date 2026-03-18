@@ -1,6 +1,6 @@
 # GLM OCR Studio
 
-Windows-first OCR studio for `glmocr`.
+Windows-first OCR studio for `glmocr`. Model:[zai-org/GLM-OCR](https://huggingface.co/zai-org/GLM-OCR)
 
 The web GUI is the primary entry point. The desktop launcher is kept as a
 secondary fallback.
