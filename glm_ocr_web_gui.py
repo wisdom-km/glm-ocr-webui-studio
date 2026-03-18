@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -9,7 +10,9 @@ import tempfile
 import time
 import threading
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
 import gradio as gr
@@ -139,6 +142,141 @@ def estimate_units(paths: list[str]) -> list[tuple[str, int]]:
 
 def render_progress(label: str, percent: float, eta: str) -> str:
     return BAR_TEMPLATE.format(label=label, percent=max(0.0, min(100.0, percent)), eta=eta)
+
+
+def sanitize_output_name(value: str) -> str:
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", value)
+    value = value.rstrip(" .")
+    return value or "result"
+
+
+def expected_saved_dir(output_root: Path, file_path: str) -> Path:
+    return output_root / sanitize_output_name(Path(file_path).stem)
+
+
+def resolve_saved_dir(output_root: Path, file_path: str) -> Path:
+    expected = expected_saved_dir(output_root, file_path)
+    if expected.exists():
+        return expected
+
+    candidates = [p for p in output_root.iterdir() if p.is_dir()] if output_root.exists() else []
+    matching = [p for p in candidates if p.name == expected.name]
+    if matching:
+        return matching[0]
+    return expected
+
+
+def collect_saved_artifacts(saved_dir: Path) -> list[Path]:
+    if not saved_dir.exists():
+        return []
+    return [
+        child
+        for child in sorted(saved_dir.rglob("*"))
+        if child.is_file() and child.suffix.lower() in {".json", ".md", ".png", ".jpg", ".jpeg"}
+    ]
+
+
+def compute_selfhosted_file_fraction(progress_state: dict[str, Any]) -> float:
+    pages_total = max(1, int(progress_state.get("pages_total", 1)))
+    pages_loaded = min(pages_total, int(progress_state.get("pages_loaded", 0)))
+    layout_pages_done = min(pages_total, int(progress_state.get("layout_pages_done", 0)))
+    regions_total = max(0, int(progress_state.get("regions_total", 0)))
+    regions_done = min(regions_total, int(progress_state.get("regions_done", 0)))
+    parse_done = 1.0 if progress_state.get("parse_done") else 0.0
+    save_done = 1.0 if progress_state.get("save_done") else 0.0
+
+    load_ratio = pages_loaded / pages_total
+    layout_ratio = layout_pages_done / pages_total
+    if regions_total > 0:
+        region_ratio = regions_done / regions_total
+    else:
+        region_ratio = 0.0
+
+    fraction = (
+        0.15 * load_ratio
+        + 0.25 * layout_ratio
+        + 0.50 * region_ratio
+        + 0.05 * parse_done
+        + 0.05 * save_done
+    )
+    if save_done:
+        return 1.0
+    return min(max(fraction, 0.0), 0.99)
+
+
+@contextmanager
+def install_selfhosted_progress_hooks(
+    parser: GlmOcr,
+    event_queue: queue.Queue,
+    file_index: int,
+    file_path: str,
+    pages_total: int,
+):
+    pipeline = getattr(parser, "_pipeline", None)
+    if pipeline is None:
+        yield None
+        return
+
+    progress_state: dict[str, Any] = {
+        "pages_total": max(1, int(pages_total)),
+        "pages_loaded": 0,
+        "layout_pages_done": 0,
+        "regions_total": 0,
+        "regions_done": 0,
+        "parse_done": False,
+        "save_done": False,
+    }
+
+    original_iter = pipeline.page_loader.iter_pages_with_unit_indices
+    original_layout_batch = pipeline._stream_process_layout_batch
+    original_ocr_process = pipeline.ocr_client.process
+
+    def emit(event_type: str, **payload: Any) -> None:
+        event_queue.put(
+            {
+                "type": event_type,
+                "index": file_index,
+                "file_path": file_path,
+                "progress_state": dict(progress_state),
+                **payload,
+            }
+        )
+
+    def patched_iter_pages_with_unit_indices(*args: Any, **kwargs: Any):
+        for page, unit_idx in original_iter(*args, **kwargs):
+            progress_state["pages_loaded"] += 1
+            emit("page_loaded", pages_loaded=progress_state["pages_loaded"])
+            yield page, unit_idx
+
+    def patched_stream_process_layout_batch(self, batch_images, batch_indices, region_queue, images_dict, layout_results_dict, save_visualization, vis_output_dir, global_start_idx):
+        original_layout_batch(batch_images, batch_indices, region_queue, images_dict, layout_results_dict, save_visualization, vis_output_dir, global_start_idx)
+        batch_region_count = 0
+        for img_idx in batch_indices:
+            batch_region_count += len(layout_results_dict.get(img_idx, []))
+        progress_state["layout_pages_done"] += len(batch_indices)
+        progress_state["regions_total"] += batch_region_count
+        emit(
+            "layout_batch_done",
+            batch_pages=len(batch_indices),
+            batch_regions=batch_region_count,
+        )
+
+    def patched_ocr_process(request_data: dict[str, Any]):
+        response, status_code = original_ocr_process(request_data)
+        progress_state["regions_done"] += 1
+        emit("region_done", regions_done=progress_state["regions_done"])
+        return response, status_code
+
+    pipeline.page_loader.iter_pages_with_unit_indices = patched_iter_pages_with_unit_indices
+    pipeline._stream_process_layout_batch = MethodType(patched_stream_process_layout_batch, pipeline)
+    pipeline.ocr_client.process = patched_ocr_process
+
+    try:
+        yield progress_state
+    finally:
+        pipeline.page_loader.iter_pages_with_unit_indices = original_iter
+        pipeline._stream_process_layout_batch = original_layout_batch
+        pipeline.ocr_client.process = original_ocr_process
 
 
 def append_app_log(message: str) -> None:
@@ -468,6 +606,8 @@ def run_ocr(
             "download_paths": [],
             "error": None,
             "done": False,
+            "saved_count": 0,
+            "active_progress": {},
         }
 
         def worker() -> None:
@@ -503,6 +643,7 @@ def run_ocr(
                 with GlmOcr(**parser_kwargs) as parser:
                     append_app_log("parser creation done")
                     for index, (file_path, parser_input_path) in enumerate(parser_inputs, start=1):
+                        pages_total = workload[index - 1][1]
                         event_queue.put(
                             {
                                 "type": "file_start",
@@ -510,6 +651,7 @@ def run_ocr(
                                 "total": total,
                                 "file_path": file_path,
                                 "label": Path(file_path).name,
+                                "pages_total": pages_total,
                             }
                         )
                         append_app_log(f"parse start file={file_path} parser_input={parser_input_path}")
@@ -523,7 +665,27 @@ def run_ocr(
                             if end_page_id is not None:
                                 parse_kwargs["end_page_id"] = end_page_id
 
-                        result = parser.parse(parser_input_path, **parse_kwargs)
+                        if mode == "selfhosted":
+                            with install_selfhosted_progress_hooks(
+                                parser,
+                                event_queue,
+                                index,
+                                file_path,
+                                pages_total,
+                            ) as progress_state:
+                                result = parser.parse(parser_input_path, **parse_kwargs)
+                                if progress_state is not None:
+                                    progress_state["parse_done"] = True
+                                    event_queue.put(
+                                        {
+                                            "type": "parse_done",
+                                            "index": index,
+                                            "file_path": file_path,
+                                            "progress_state": dict(progress_state),
+                                        }
+                                    )
+                        else:
+                            result = parser.parse(parser_input_path, **parse_kwargs)
                         if getattr(result, "original_images", None):
                             result.original_images = [file_path]
 
@@ -533,7 +695,16 @@ def run_ocr(
                             save_layout_visualization=save_layout_visualization,
                         )
 
-                        saved_dir = output_root / Path(file_path).stem
+                        saved_dir = resolve_saved_dir(output_root, file_path)
+                        if not saved_dir.exists():
+                            raise RuntimeError(
+                                f"Output directory was not created after save: {saved_dir}"
+                            )
+                        saved_files = collect_saved_artifacts(saved_dir)
+                        if not any(path.suffix.lower() in {".json", ".md"} for path in saved_files):
+                            raise RuntimeError(
+                                f"No JSON or Markdown output was produced in: {saved_dir}"
+                            )
                         result_dict = result.to_dict()
                         state["summaries"].append(build_summary(file_path, saved_dir, result_dict))
                         state["markdown_parts"].append(
@@ -546,12 +717,27 @@ def run_ocr(
                                 "result": result_dict,
                             }
                         )
-                        state["log_lines"].append(f"[{index}/{total}] 完成，输出目录 {saved_dir}")
+                        state["log_lines"].append(f"[{index}/{total}] Saved output: {saved_dir}")
+                        append_app_log(f"result save done file={file_path} saved_dir={saved_dir}")
+                        state["saved_count"] += 1
+                        if mode == "selfhosted":
+                            event_queue.put(
+                                {
+                                    "type": "save_done",
+                                    "index": index,
+                                    "file_path": file_path,
+                                    "progress_state": {
+                                        **state["active_progress"].get(index, {}),
+                                        "pages_total": pages_total,
+                                        "parse_done": True,
+                                        "save_done": True,
+                                    },
+                                    "saved_dir": str(saved_dir),
+                                }
+                            )
 
-                        if saved_dir.exists():
-                            for child in sorted(saved_dir.rglob("*")):
-                                if child.is_file():
-                                    state["download_paths"].append(str(child))
+                        for child in saved_files:
+                            state["download_paths"].append(str(child))
 
                         event_queue.put(
                             {
@@ -603,11 +789,52 @@ def run_ocr(
 
                 if event["type"] == "file_start":
                     current_label = f"处理 {event['label']}"
+                    state["active_progress"][event["index"]] = {
+                        "pages_total": event.get("pages_total", workload[event["index"] - 1][1]),
+                        "pages_loaded": 0,
+                        "layout_pages_done": 0,
+                        "regions_total": 0,
+                        "regions_done": 0,
+                        "parse_done": False,
+                        "save_done": False,
+                    }
                     state["log_lines"].append(
                         f"[{event['index']}/{event['total']}] 开始处理 {event['file_path']}"
                     )
+                elif event["type"] == "page_loaded":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    current_label = (
+                        f"加载页面 {event['progress_state'].get('pages_loaded', 0)}/"
+                        f"{event['progress_state'].get('pages_total', 0)}"
+                    )
+                    state["log_lines"].append(
+                        f"[{event['index']}/{len(paths)}] 页面加载 {event['progress_state'].get('pages_loaded', 0)}/{event['progress_state'].get('pages_total', 0)}"
+                    )
+                elif event["type"] == "layout_batch_done":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    current_label = (
+                        f"版面分析 {event['progress_state'].get('layout_pages_done', 0)}/"
+                        f"{event['progress_state'].get('pages_total', 0)}"
+                    )
+                    state["log_lines"].append(
+                        f"[{event['index']}/{len(paths)}] 版面分析完成批次：页 {event['progress_state'].get('layout_pages_done', 0)}/{event['progress_state'].get('pages_total', 0)}，regions={event['progress_state'].get('regions_total', 0)}"
+                    )
+                elif event["type"] == "region_done":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    regions_done = event["progress_state"].get("regions_done", 0)
+                    regions_total = event["progress_state"].get("regions_total", 0)
+                    current_label = f"OCR 识别 {regions_done}/{max(regions_total, regions_done)}"
+                elif event["type"] == "parse_done":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    current_label = "解析完成，正在保存"
+                    state["log_lines"].append(f"[{event['index']}/{len(paths)}] 解析完成，开始保存输出")
+                elif event["type"] == "save_done":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    current_label = "保存完成"
+                    state["log_lines"].append(f"[{event['index']}/{len(paths)}] 保存完成")
                 elif event["type"] == "file_done":
                     completed_units += workload[event["index"] - 1][1]
+                    state["active_progress"].pop(event["index"], None)
                     current_label = f"完成 {event['index']}/{event['total']}"
                 elif event["type"] == "done":
                     pass
@@ -622,12 +849,24 @@ def run_ocr(
                 eta_seconds = total_units * heuristic_per_unit
 
             if not state["done"]:
-                smoothing_target = completed_units
-                if completed_units < total_units:
-                    elapsed_units = min(total_units, max(completed_units, elapsed / max(eta_seconds, 1e-6) * total_units))
-                    smoothing_target = max(completed_units, elapsed_units)
-                display_percent = (smoothing_target / total_units) * 100.0
-                eta_text = format_eta(eta_seconds)
+                if mode == "selfhosted" and state["active_progress"]:
+                    current_units_progress = 0.0
+                    for file_index, progress_state in state["active_progress"].items():
+                        file_units = workload[file_index - 1][1]
+                        current_units_progress += file_units * compute_selfhosted_file_fraction(progress_state)
+                    display_percent = ((completed_units + current_units_progress) / total_units) * 100.0
+                    if state["saved_count"] < len(paths):
+                        display_percent = min(display_percent, 99.0)
+                    eta_text = format_eta(eta_seconds if completed_units > 0 else None)
+                else:
+                    smoothing_target = completed_units
+                    if completed_units < total_units:
+                        elapsed_units = min(total_units, max(completed_units, elapsed / max(eta_seconds, 1e-6) * total_units))
+                        smoothing_target = max(completed_units, elapsed_units)
+                    display_percent = (smoothing_target / total_units) * 100.0
+                    if state["saved_count"] < len(paths):
+                        display_percent = min(display_percent, 99.0)
+                    eta_text = format_eta(eta_seconds)
                 progress_html = render_progress(current_label, display_percent, eta_text)
                 summary_text = "\n\n" + ("\n" + ("-" * 60) + "\n\n").join(state["summaries"]) if state["summaries"] else ""
                 markdown_text = "\n\n".join(state["markdown_parts"])

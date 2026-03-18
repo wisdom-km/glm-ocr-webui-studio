@@ -123,3 +123,73 @@ This was not just a cosmetic cleanup. The app had a real usability gap:
 - debugging required guessing instead of reading the actual traceback
 
 The upgrade path fixes that by making the request boundary defensive and by keeping later-stage failures visible. The result is a more usable OCR workflow on Windows without changing the overall app design or adding unnecessary refactoring.
+
+## 3. False `100%` completion and mismatched output folder detection
+
+### Symptom
+
+Large PDF jobs could appear to finish in the Web GUI even though:
+
+- the progress bar showed `100.0%`
+- the output file area stayed empty
+- the expected output folder name did not appear in the configured output directory
+
+In practice, the OCR job was often still inside `parser.parse(...)`, or the GUI was looking for the wrong saved directory name.
+
+### Root Cause
+
+There were two concrete issues:
+
+1. The progress bar used a smoothed estimate and could visually reach `100%` before `result.save(...)` had actually completed.
+2. The GUI assumed the saved folder name was always `Path(file_path).stem`, while `glmocr` internally sanitizes Windows-illegal characters before saving.
+
+That meant a long filename such as one containing `:` or `?` could be saved under a sanitized folder name, while the GUI kept checking a different unsanitized path.
+
+### Fix
+
+I aligned the GUI with the actual `glmocr` save behavior:
+
+- added a local output-name sanitizer that mirrors `glmocr`'s save logic
+- resolved the expected saved directory using the sanitized stem
+- verified that `.md` and `.json` files actually exist after `result.save(...)`
+- prevented the progress bar from claiming `100%` until save completion is confirmed
+
+### Result
+
+The Web GUI no longer reports a finished job before output files are truly written.
+
+If saving does not actually produce Markdown or JSON files, the run now fails explicitly instead of showing a false success state.
+
+## 4. Initial selfhosted progress event integration
+
+### Symptom
+
+The old progress implementation was file-level and estimate-based. For large PDFs this produced misleading UI behavior:
+
+- labels looked active
+- percent could be disconnected from the actual OCR stage
+- logs were too sparse to show whether the pipeline was still making progress
+
+### Root Cause
+
+The `selfhosted` execution path runs the `glmocr` pipeline locally in the GUI process, but the Web GUI was only tracking coarse start / done events.
+
+That meant the page loading, layout batching, OCR region processing, and save stages were not being reflected in the UI as first-class progress events.
+
+### Fix
+
+I added runtime hooks around the local `glmocr` pipeline so the GUI can observe selfhosted stages such as:
+
+- page loading
+- layout batch completion
+- OCR region completion
+- parse completion
+- save completion
+
+These hooks now feed the GUI's active progress state instead of relying only on file-level smoothing.
+
+### Result
+
+The current version is materially closer to real execution progress in `selfhosted` mode, and it prevents the most misleading false-finish behavior.
+
+There are still follow-up improvements to make around locking, ETA calculation, and event ordering, but the app now exposes more of the real OCR lifecycle than before.
