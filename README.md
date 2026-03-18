@@ -92,5 +92,3 @@ Typical exports include:
 - Based on [`NaserTahiri/GLM-OCR-GUI`](https://github.com/NaserTahiri/GLM-OCR-GUI)
 - Built and adapted with Codex
 - Based on the `glmocr` SDK
-- README structure and publishing flow were inspired by
-  [`wisdom-km/LYRIC-SYNC`](https://github.com/wisdom-km/LYRIC-SYNC)
