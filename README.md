@@ -89,6 +89,18 @@ Typical exports include:
 - JSON
 - Optional layout analysis artifacts
 
+## Recommended Workflow For Long PDFs
+
+For long or layout-heavy PDFs, prefer this operating pattern:
+
+1. Use `selfhosted` mode only after the local backend is fully ready.
+2. If the PDF is very large, test one page or a short page range first.
+3. For `selfhosted + PDF`, the app now renders PDF pages into images first and then processes them page by page.
+4. Watch `logs/runtime/glm_ocr_web_gui.log` and `logs/runtime/glm_ocr_local_server.log` if the job looks slow.
+5. If one page is much heavier than the others, the page-level path will make the stuck page and retry state visible instead of failing the whole document opaquely.
+
+This is the recommended path for books, scanned PDFs, mixed layout pages, and documents that previously looked frozen in `parser.parse(...)`.
+
 ## Notes
 
 - `selfhosted` mode does not need an API key.

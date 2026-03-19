@@ -85,6 +85,20 @@ launch_glm_ocr_desktop.bat
 - JSON
 - 可选的版面分析图
 
+## 长 PDF 推荐工作流
+
+对于页数很多、版面复杂、或者以前容易卡住的 PDF，建议按下面的方式使用：
+
+1. 先确认本地 `selfhosted` 后端已经就绪。
+2. 如果 PDF 很大，先测单页或短页范围，再放大到整段范围。
+3. 现在 `selfhosted + PDF` 会先把 PDF 渲染成图片页，再按页处理。
+4. 如果任务看起来变慢，优先看：
+   - `logs/runtime/glm_ocr_web_gui.log`
+   - `logs/runtime/glm_ocr_local_server.log`
+5. 如果某一页特别重，当前实现会把卡住页、重试状态、服务重启状态暴露出来，而不是整本书直接黑箱失败。
+
+这也是当前推荐用于书籍、扫描版 PDF、图文混排 PDF、以及曾经在 `parser.parse(...)` 阶段看起来像卡死的文档的工作流。
+
 ## 说明
 
 - `selfhosted` 模式不需要 API Key。
