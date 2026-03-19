@@ -67,6 +67,15 @@ The launcher tries `conda run -n glm-ocr python` first, then falls back to
 - `launch_glm_ocr_web_gui.bat` - web UI launcher
 - `launch_glm_ocr_local_server.bat` - backend launcher
 
+## Project Layout
+
+- `docs/maintenance/` - engineering change log and maintenance notes
+- `docs/troubleshooting/` - user-facing troubleshooting guides
+- `logs/runtime/` - long-lived application and backend runtime logs
+- `logs/debug/` - one-off debug, smoke-test, and validation logs
+- `glm_ocr_outputs_web/` - Web GUI OCR results
+- `glm_ocr_outputs/` - desktop/local OCR results
+
 ## Output
 
 By default, outputs are written under the repository-local output folders:
@@ -86,6 +95,8 @@ Typical exports include:
 - API fields are hidden unless `maas` is selected.
 - Output and cache folders are ignored by Git.
 - The web GUI is the primary interface; the desktop GUI is kept as a fallback.
+- Runtime logs are written under `logs/runtime/`.
+- Troubleshooting and repair history are kept under `docs/`.
 
 ## Attribution
 - Base model: [zai-org/GLM-OCR](https://huggingface.co/zai-org/GLM-OCR)

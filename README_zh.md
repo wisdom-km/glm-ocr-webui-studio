@@ -63,6 +63,15 @@ launch_glm_ocr_desktop.bat
 - `launch_glm_ocr_web_gui.bat` - Web 启动器
 - `launch_glm_ocr_local_server.bat` - 后端启动器
 
+## 项目结构
+
+- `docs/maintenance/` - 工程修复日志与维护记录
+- `docs/troubleshooting/` - 面向使用者的排障文档
+- `logs/runtime/` - 稳定保留的运行日志
+- `logs/debug/` - 一次性调试、验证、烟雾测试日志
+- `glm_ocr_outputs_web/` - Web GUI 识别输出
+- `glm_ocr_outputs/` - 桌面/本地识别输出
+
 ## 输出内容
 
 默认输出会放到仓库内的目录：
@@ -82,6 +91,8 @@ launch_glm_ocr_desktop.bat
 - 只有选择 `maas` 时，API 输入区才会显示。
 - 输出目录和缓存目录都已加入 Git 忽略。
 - Web GUI 是主入口，桌面 GUI 作为备用。
+- 运行日志默认写入 `logs/runtime/`。
+- 排障文档和修复记录统一放在 `docs/` 目录下。
 
 ## 致谢
 

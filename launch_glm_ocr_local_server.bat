@@ -1,11 +1,16 @@
 @echo off
 setlocal
 
+set "ROOT=%~dp0"
+set "LOG_DIR=%ROOT%logs\runtime"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+set "SERVER_LOG=%LOG_DIR%\glm_ocr_local_server.log"
+
 call :resolve_python
 if errorlevel 1 exit /b 1
 
-pushd "%~dp0"
-%PYTHON_CMD% "%~dp0glm_ocr_local_server.py"
+pushd "%ROOT%"
+%PYTHON_CMD% "%ROOT%glm_ocr_local_server.py" >> "%SERVER_LOG%" 2>&1
 popd
 
 endlocal

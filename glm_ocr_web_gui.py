@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import queue
 import re
@@ -26,7 +27,14 @@ from glmocr.maas_client import MissingApiKeyError
 
 APP_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = APP_ROOT / "glm_ocr_outputs_web"
-APP_LOG_FILE = APP_ROOT / "glm_ocr_web_gui.log"
+LOGS_ROOT = APP_ROOT / "logs"
+RUNTIME_LOG_DIR = LOGS_ROOT / "runtime"
+DEBUG_LOG_DIR = LOGS_ROOT / "debug"
+DOCS_ROOT = APP_ROOT / "docs"
+MAINTENANCE_DOCS_DIR = DOCS_ROOT / "maintenance"
+TROUBLESHOOTING_DOCS_DIR = DOCS_ROOT / "troubleshooting"
+APP_LOG_FILE = RUNTIME_LOG_DIR / "glm_ocr_web_gui.log"
+SELFHOSTED_SERVER_LOG_FILE = RUNTIME_LOG_DIR / "glm_ocr_local_server.log"
 STAGING_ROOT = Path(tempfile.gettempdir()) / "glmocr_staging"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".pdf"}
 SELFHOSTED_HOST = "127.0.0.1"
@@ -37,6 +45,7 @@ BAR_TEMPLATE = """
     <span class="status-title">{label}</span>
     <span class="status-percent">{percent:.1f}%</span>
   </div>
+  <div class="status-stage">{stage}</div>
   <div class="status-meter">
     <div class="status-meter-fill" style="width:{percent:.1f}%"></div>
   </div>
@@ -129,19 +138,74 @@ def count_pdf_pages(path: Path) -> int:
         return 1
 
 
-def estimate_units(paths: list[str]) -> list[tuple[str, int]]:
+def resolve_pdf_page_range(
+    path: Path,
+    start_page_id: int | None,
+    end_page_id: int | None,
+) -> tuple[int, int, int, int]:
+    total_pages = max(1, count_pdf_pages(path))
+    start_page = start_page_id or 1
+    end_page = end_page_id or total_pages
+    start_page = min(max(1, start_page), total_pages)
+    end_page = min(max(start_page, end_page), total_pages)
+    selected_pages = max(1, end_page - start_page + 1)
+    return total_pages, start_page, end_page, selected_pages
+
+
+def render_pdf_range_to_images(
+    file_path: str,
+    staging_dir: Path,
+    index: int,
+    start_page_id: int | None,
+    end_page_id: int | None,
+    dpi: int = 200,
+) -> tuple[list[str], int]:
+    source = Path(file_path)
+    _, start_page, end_page, selected_pages = resolve_pdf_page_range(
+        source,
+        start_page_id,
+        end_page_id,
+    )
+    doc = pdfium.PdfDocument(str(source))
+    scale = max(float(dpi) / 72.0, 1.0)
+    rendered_paths: list[str] = []
+    for page_no in range(start_page - 1, end_page):
+        page = doc[page_no]
+        bitmap = page.render(scale=scale)
+        pil_image = bitmap.to_pil()
+        page_path = staging_dir / f"input_{index}_page_{page_no + 1:04d}.png"
+        pil_image.save(page_path)
+        rendered_paths.append(str(page_path))
+    return rendered_paths, selected_pages
+
+
+def estimate_units(
+    paths: list[str],
+    start_page_id: int | None = None,
+    end_page_id: int | None = None,
+) -> list[tuple[str, int]]:
     units: list[tuple[str, int]] = []
     for file_path in paths:
         suffix = Path(file_path).suffix.lower()
         if suffix == ".pdf":
-            units.append((file_path, max(1, count_pdf_pages(Path(file_path)))))
+            _, _, _, selected_pages = resolve_pdf_page_range(
+                Path(file_path),
+                start_page_id,
+                end_page_id,
+            )
+            units.append((file_path, selected_pages))
         else:
             units.append((file_path, 1))
     return units
 
 
-def render_progress(label: str, percent: float, eta: str) -> str:
-    return BAR_TEMPLATE.format(label=label, percent=max(0.0, min(100.0, percent)), eta=eta)
+def render_progress(label: str, percent: float, eta: str, stage: str = "当前阶段：等待任务开始") -> str:
+    return BAR_TEMPLATE.format(
+        label=label,
+        percent=max(0.0, min(100.0, percent)),
+        eta=eta,
+        stage=stage,
+    )
 
 
 def sanitize_output_name(value: str) -> str:
@@ -178,24 +242,20 @@ def collect_saved_artifacts(saved_dir: Path) -> list[Path]:
 
 def compute_selfhosted_file_fraction(progress_state: dict[str, Any]) -> float:
     pages_total = max(1, int(progress_state.get("pages_total", 1)))
+    pages_done = min(pages_total, int(progress_state.get("pages_done", 0)))
     pages_loaded = min(pages_total, int(progress_state.get("pages_loaded", 0)))
     layout_pages_done = min(pages_total, int(progress_state.get("layout_pages_done", 0)))
-    regions_total = max(0, int(progress_state.get("regions_total", 0)))
-    regions_done = min(regions_total, int(progress_state.get("regions_done", 0)))
     parse_done = 1.0 if progress_state.get("parse_done") else 0.0
     save_done = 1.0 if progress_state.get("save_done") else 0.0
 
+    page_done_ratio = pages_done / pages_total
     load_ratio = pages_loaded / pages_total
     layout_ratio = layout_pages_done / pages_total
-    if regions_total > 0:
-        region_ratio = regions_done / regions_total
-    else:
-        region_ratio = 0.0
 
     fraction = (
-        0.15 * load_ratio
-        + 0.25 * layout_ratio
-        + 0.50 * region_ratio
+        0.70 * page_done_ratio
+        + 0.10 * load_ratio
+        + 0.10 * layout_ratio
         + 0.05 * parse_done
         + 0.05 * save_done
     )
@@ -204,13 +264,367 @@ def compute_selfhosted_file_fraction(progress_state: dict[str, Any]) -> float:
     return min(max(fraction, 0.0), 0.99)
 
 
+def snapshot_progress_state(progress_state: dict[str, Any]) -> dict[str, Any]:
+    lock = progress_state.get("_lock")
+    if lock is None:
+        return {k: v for k, v in progress_state.items() if not k.startswith("_")}
+    with lock:
+        return {k: v for k, v in progress_state.items() if not k.startswith("_")}
+
+
+def update_progress_state(progress_state: dict[str, Any], **updates: Any) -> dict[str, Any]:
+    with progress_state["_lock"]:
+        progress_state.update(updates)
+        progress_state["last_event_at"] = time.time()
+        return {k: v for k, v in progress_state.items() if not k.startswith("_")}
+
+
+def increment_progress_state(
+    progress_state: dict[str, Any], key: str, amount: int = 1
+) -> dict[str, Any]:
+    with progress_state["_lock"]:
+        progress_state[key] = int(progress_state.get(key, 0)) + amount
+        progress_state["last_event_at"] = time.time()
+        return {k: v for k, v in progress_state.items() if not k.startswith("_")}
+
+
+def _describe_selfhosted_progress_legacy(progress_state: dict[str, Any]) -> tuple[str, str, int, int]:
+    snapshot = snapshot_progress_state(progress_state)
+    pages_total = max(1, int(snapshot.get("pages_total", 1)))
+    pages_loaded = min(pages_total, int(snapshot.get("pages_loaded", 0)))
+    layout_pages_done = min(pages_total, int(snapshot.get("layout_pages_done", 0)))
+    regions_total = max(0, int(snapshot.get("regions_total", 0)))
+    regions_done = min(regions_total, int(snapshot.get("regions_done", 0)))
+    parse_done = bool(snapshot.get("parse_done"))
+    save_done = bool(snapshot.get("save_done"))
+
+    if save_done:
+        return f"当前进度：{pages_total} / {pages_total} 页", "finished", pages_total, pages_total
+    if parse_done:
+        return "当前进度：解析完成，正在保存", "saving", layout_pages_done or pages_loaded, pages_total
+    if regions_total > 0:
+        return f"当前进度：OCR 识别 {regions_done} / {regions_total}", "running", regions_done, regions_total
+    if layout_pages_done > 0:
+        return f"当前进度：版面分析 {layout_pages_done} / {pages_total} 页", "running", layout_pages_done, pages_total
+    if pages_loaded > 0:
+        return f"当前进度：页面加载 {pages_loaded} / {pages_total} 页", "counting", pages_loaded, pages_total
+    return f"当前进度：0 / {pages_total} 页", "preparing", 0, pages_total
+
+
+def progress_stage_text(progress_state: dict[str, Any], phase: str) -> str:
+    snapshot = snapshot_progress_state(progress_state)
+    if snapshot.get("save_done"):
+        return "已完成"
+    if snapshot.get("parse_done"):
+        return "解析完成，正在保存"
+    if phase == "running":
+        if int(snapshot.get("regions_total", 0)) > 0:
+            return "OCR 识别中"
+        if int(snapshot.get("layout_pages_done", 0)) > 0:
+            return "正在版面分析"
+        if int(snapshot.get("pages_loaded", 0)) > 0:
+            return "正在渲染页面"
+    if phase == "counting":
+        return "正在加载页面"
+    if phase == "backend_wait":
+        return "正在等待本地 OCR 服务响应"
+    if phase == "retrying":
+        return "正在重试当前页"
+    if phase == "restarting_service":
+        return "正在重启本地 OCR 服务"
+    if phase == "page_failed":
+        return "当前页失败，继续后续页面"
+    return "正在打开 PDF"
+
+
+def format_progress_foot(stage_text: str, remaining_seconds: float | None) -> str:
+    return f"当前阶段：{stage_text} | {format_remaining_time(remaining_seconds)}"
+
+
+def is_selfhosted_timeout_error(exc: Exception) -> bool:
+    message = f"{type(exc).__name__}: {exc}"
+    return "Read timed out" in message or "ConnectionResetError" in message or (
+        "HTTPConnectionPool" in message and "127.0.0.1" in message and "5002" in message
+    )
+
+
+def summarize_task_failure(exc: Exception, mode: str) -> str:
+    raw_error = f"{type(exc).__name__}: {exc}"
+    if mode == "selfhosted":
+        timeout_match = re.search(r"read timeout=(\d+)", raw_error, re.IGNORECASE)
+        if "Read timed out" in raw_error:
+            timeout_text = f"{timeout_match.group(1)} 秒" if timeout_match else "300 秒"
+            return f"本地 OCR 服务请求超时：127.0.0.1:5002，{timeout_text} 内未返回结果。"
+        if "ConnectionResetError" in raw_error:
+            return "本地 OCR 服务连接中断：127.0.0.1:5002。"
+    return raw_error
+
+
+def estimate_selfhosted_eta_seconds(
+    current_progress: dict[str, Any] | None,
+    current_file_units: float,
+    total_units: float,
+    completed_units: float,
+    task_started_at: float,
+) -> float | None:
+    if current_progress is None or current_file_units <= 0 or total_units <= 0:
+        return None
+
+    snapshot = snapshot_progress_state(current_progress)
+    fraction = compute_selfhosted_file_fraction(snapshot)
+    if fraction <= 0.01:
+        return None
+
+    elapsed_task = max(0.0, time.time() - task_started_at)
+    progress_units = completed_units + (current_file_units * fraction)
+    if progress_units <= 0:
+        return None
+
+    progress_ratio = min(max(progress_units / float(total_units), 1e-6), 0.999999)
+    estimated_total = elapsed_task / progress_ratio
+    return max(0.0, estimated_total - elapsed_task)
+
+
+def describe_selfhosted_page_counts(progress_state: dict[str, Any]) -> tuple[int, int]:
+    snapshot = snapshot_progress_state(progress_state)
+    pages_total = max(1, int(snapshot.get("pages_total", 1)))
+    pages_done = min(pages_total, int(snapshot.get("pages_done", 0)))
+    parse_done = bool(snapshot.get("parse_done"))
+    save_done = bool(snapshot.get("save_done"))
+
+    if save_done or parse_done:
+        return pages_total, pages_total
+
+    return min(pages_done, pages_total), pages_total
+
+
+def describe_selfhosted_progress(
+    progress_state: dict[str, Any],
+) -> tuple[str, str, str, int, int]:
+    snapshot = snapshot_progress_state(progress_state)
+    current_pages, pages_total = describe_selfhosted_page_counts(snapshot)
+    pages_loaded = min(pages_total, int(snapshot.get("pages_loaded", 0)))
+    layout_pages_done = min(pages_total, int(snapshot.get("layout_pages_done", 0)))
+    current_page_hint = min(pages_total, max(1, int(snapshot.get("current_page_hint", 1))))
+    current_page_region_done = max(0, int(snapshot.get("current_page_region_done", 0)))
+    current_page_region_total = max(0, int(snapshot.get("current_page_region_total", 0)))
+    parse_done = bool(snapshot.get("parse_done"))
+    save_done = bool(snapshot.get("save_done"))
+    phase = str(snapshot.get("phase") or "preparing")
+
+    if save_done:
+        return (
+            f"当前进度：{pages_total} / {pages_total} 页",
+            "当前阶段：已完成",
+            "finished",
+            pages_total,
+            pages_total,
+        )
+    if parse_done:
+        return (
+            f"当前进度：{pages_total} / {pages_total} 页",
+            "当前阶段：正在保存结果",
+            "saving",
+            pages_total,
+            pages_total,
+        )
+    if current_pages > 0:
+        return (
+            f"当前进度：{current_pages} / {pages_total} 页",
+            (
+                f"当前阶段：正在处理第 {min(current_pages + 1, pages_total)} 页"
+                if current_pages < pages_total
+                else "当前阶段：正在完成最后收尾"
+            ),
+            "running",
+            current_pages,
+            pages_total,
+        )
+    if layout_pages_done > 0:
+        stage_text = "当前阶段：正在进行版面分析"
+        if current_page_region_total > 0:
+            stage_text = (
+                f"当前阶段：当前页局部识别 第{current_page_hint}页 "
+                f"{current_page_region_done}/{current_page_region_total} 区块"
+            )
+        return (
+            f"当前进度：0 / {pages_total} 页",
+            stage_text,
+            "running",
+            0,
+            pages_total,
+        )
+    if pages_loaded > 0:
+        stage_text = "当前阶段：正在加载页面"
+        if current_page_region_total > 0:
+            stage_text = (
+                f"当前阶段：当前页局部识别 第{current_page_hint}页 "
+                f"{current_page_region_done}/{current_page_region_total} 区块"
+            )
+        return (
+            f"当前进度：0 / {pages_total} 页",
+            stage_text,
+            "counting",
+            0,
+            pages_total,
+        )
+
+    phase_to_stage = {
+        "preparing": "当前阶段：准备解析任务",
+        "parse_prepare_start": "当前阶段：准备解析任务",
+        "pdf_opened": "当前阶段：正在打开 PDF",
+        "page_render_start": "当前阶段：正在渲染第一页",
+        "first_page_wait": "当前阶段：正在等待第一页进入 OCR",
+        "backend_wait": (
+            f"当前阶段：当前页局部识别 第{current_page_hint}页 "
+            f"{current_page_region_done}/{current_page_region_total} 区块（等待本地 OCR 服务响应）"
+            if current_page_region_total > 0
+            else "当前阶段：正在等待本地 OCR 服务响应"
+        ),
+        "retrying": f"当前阶段：正在重试第 {current_page_hint} 页",
+        "restarting_service": "当前阶段：正在重启本地 OCR 服务",
+        "page_failed": f"当前阶段：第 {current_page_hint} 页失败，继续后续页面",
+        "failed": "当前阶段：任务失败",
+    }
+    return (
+        f"当前进度：0 / {pages_total} 页",
+        phase_to_stage.get(phase, "当前阶段：准备解析任务"),
+        phase,
+        0,
+        pages_total,
+    )
+
+
+def extract_backend_timeout_details(text: str) -> dict[str, Any] | None:
+    if "Read timed out" not in text and "read timeout" not in text.lower():
+        return None
+    host_match = re.search(r"host='([^']+)'", text)
+    port_match = re.search(r"port=(\d+)", text)
+    timeout_match = re.search(r"read timeout[= ](\d+)", text, flags=re.IGNORECASE)
+    host = host_match.group(1) if host_match else SELFHOSTED_HOST
+    port = int(port_match.group(1)) if port_match else SELFHOSTED_PORT
+    timeout_seconds = int(timeout_match.group(1)) if timeout_match else 300
+    return {
+        "service": f"{host}:{port}",
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def extract_runtime_context_details(text: str) -> dict[str, str]:
+    details: dict[str, str] = {}
+    phase_match = re.search(r"phase=([A-Za-z0-9_:-]+)", text)
+    current_match = re.search(r"current=([0-9]+)", text)
+    total_match = re.search(r"total=([0-9]+)", text)
+    item_match = re.search(r"item=([0-9]+)", text)
+    wait_match = re.search(r"elapsed_wait=([0-9]+s)", text)
+    request_match = re.search(r"request_id=([A-Za-z0-9_:-]+)", text)
+    page_match = re.search(r"page=([0-9]+)", text)
+    region_match = re.search(r"region=([0-9]+)", text)
+    if phase_match:
+        details["phase"] = phase_match.group(1)
+    if current_match and total_match:
+        details["progress"] = f"{current_match.group(1)}/{total_match.group(1)}"
+    if item_match:
+        details["item"] = item_match.group(1)
+    if wait_match:
+        details["elapsed_wait"] = wait_match.group(1)
+    if request_match:
+        details["request_id"] = request_match.group(1)
+    if page_match:
+        details["page"] = page_match.group(1)
+    if region_match:
+        details["region"] = region_match.group(1)
+    return details
+
+
+def summarize_error_for_ui(error_msg: str, traceback_text: str = "") -> dict[str, str]:
+    combined = "\n".join(part for part in (error_msg, traceback_text) if part)
+    timeout_info = extract_backend_timeout_details(combined)
+    if timeout_info:
+        timeout_seconds = timeout_info["timeout_seconds"]
+        service = timeout_info["service"]
+        context = extract_runtime_context_details(combined)
+        context_lines = []
+        if context.get("phase"):
+            context_lines.append(f"当前阶段：{context['phase']}")
+        if context.get("item"):
+            context_lines.append(f"当前文件序号：{context['item']}")
+        if context.get("progress"):
+            context_lines.append(f"阶段进度：{context['progress']}")
+        if context.get("elapsed_wait"):
+            context_lines.append(f"已等待：{context['elapsed_wait']}")
+        context_text = ("\n" + "\n".join(context_lines)) if context_lines else ""
+        return {
+            "summary": f"本地 OCR 服务请求超时（{service}，{timeout_seconds} 秒）",
+            "stage": "当前阶段：等待本地 OCR 服务超时",
+            "detail": (
+                f"原因：本地 OCR 服务 {service} 在 {timeout_seconds} 秒内未返回结果。"
+                f"{context_text}\n"
+                "建议检查 selfhosted 服务是否卡住、推理过慢，或是否存在单页处理异常。"
+            ),
+        }
+    return {
+        "summary": f"识别失败：{error_msg}",
+        "stage": "当前阶段：任务失败",
+        "detail": f"原因：{error_msg}",
+    }
+
+
+def summarize_error_for_ui_v2(error_msg: str, traceback_text: str = "") -> dict[str, str]:
+    combined = "\n".join(part for part in (error_msg, traceback_text) if part)
+    timeout_info = extract_backend_timeout_details(combined)
+    if timeout_info:
+        timeout_seconds = timeout_info["timeout_seconds"]
+        service = timeout_info["service"]
+        context = extract_runtime_context_details(combined)
+        context_lines: list[str] = []
+        if context.get("phase"):
+            context_lines.append(f"阶段：{context['phase']}")
+        if context.get("item"):
+            context_lines.append(f"任务项：{context['item']}")
+        if context.get("progress"):
+            context_lines.append(f"当前进度：{context['progress']}")
+        location_parts: list[str] = []
+        if context.get("page"):
+            location_parts.append(f"page={context['page']}")
+        if context.get("region"):
+            location_parts.append(f"region={context['region']}")
+        if location_parts:
+            context_lines.append(f"卡住位置：{', '.join(location_parts)}")
+        if context.get("request_id"):
+            context_lines.append(f"请求 ID：{context['request_id']}")
+        if context.get("elapsed_wait"):
+            context_lines.append(f"已等待：{context['elapsed_wait']}")
+        context_text = ("\n" + "\n".join(context_lines)) if context_lines else ""
+        return {
+            "summary": f"本地 OCR 服务请求超时：{service}（{timeout_seconds} 秒）",
+            "stage": "当前阶段：等待本地 OCR 服务超时",
+            "detail": (
+                f"本地 OCR 服务 {service} 在 {timeout_seconds} 秒内未返回结果。"
+                f"{context_text}\n"
+                "建议：检查 selfhosted 本地服务是否卡在单页或单个局部请求的生成阶段。"
+            ),
+        }
+    return {
+        "summary": f"识别失败：{error_msg}",
+        "stage": "当前阶段：任务失败",
+        "detail": f"错误详情：{error_msg}",
+    }
+
+
 @contextmanager
 def install_selfhosted_progress_hooks(
     parser: GlmOcr,
     event_queue: queue.Queue,
+    task_id: str,
     file_index: int,
     file_path: str,
     pages_total: int,
+    *,
+    initial_pages_done: int = 0,
+    initial_pages_loaded: int = 0,
+    initial_layout_pages_done: int = 0,
+    initial_page_hint: int = 1,
 ):
     pipeline = getattr(parser, "_pipeline", None)
     if pipeline is None:
@@ -219,17 +633,33 @@ def install_selfhosted_progress_hooks(
 
     progress_state: dict[str, Any] = {
         "pages_total": max(1, int(pages_total)),
-        "pages_loaded": 0,
-        "layout_pages_done": 0,
+        "pages_done": max(0, int(initial_pages_done)),
+        "pages_loaded": max(0, int(initial_pages_loaded)),
+        "layout_pages_done": max(0, int(initial_layout_pages_done)),
         "regions_total": 0,
         "regions_done": 0,
         "parse_done": False,
         "save_done": False,
+        "phase": "preparing",
+        "backend_wait_started_at": None,
+        "current_request_id": "",
+        "current_page_hint": max(1, int(initial_page_hint)),
+        "current_page_region_done": 0,
+        "current_page_region_total": 0,
+        "request_seq": 0,
+        "per_page_regions": {},
+        "last_backend_activity_at": time.time(),
+        "failure_reason": "",
+        "failure_stage": "",
+        "started_at": time.time(),
+        "last_event_at": time.time(),
+        "_lock": threading.Lock(),
     }
 
     original_iter = pipeline.page_loader.iter_pages_with_unit_indices
     original_layout_batch = pipeline._stream_process_layout_batch
     original_ocr_process = pipeline.ocr_client.process
+    original_process = pipeline.process
 
     def emit(event_type: str, **payload: Any) -> None:
         event_queue.put(
@@ -237,39 +667,234 @@ def install_selfhosted_progress_hooks(
                 "type": event_type,
                 "index": file_index,
                 "file_path": file_path,
-                "progress_state": dict(progress_state),
+                "progress_state": snapshot_progress_state(progress_state),
                 **payload,
             }
         )
 
     def patched_iter_pages_with_unit_indices(*args: Any, **kwargs: Any):
         for page, unit_idx in original_iter(*args, **kwargs):
-            progress_state["pages_loaded"] += 1
-            emit("page_loaded", pages_loaded=progress_state["pages_loaded"])
+            snapshot = increment_progress_state(progress_state, "pages_loaded", 1)
+            snapshot = update_progress_state(
+                progress_state,
+                phase="counting",
+                last_backend_activity_at=time.time(),
+            )
+            emit("page_loaded", pages_loaded=snapshot["pages_loaded"])
             yield page, unit_idx
 
     def patched_stream_process_layout_batch(self, batch_images, batch_indices, region_queue, images_dict, layout_results_dict, save_visualization, vis_output_dir, global_start_idx):
-        original_layout_batch(batch_images, batch_indices, region_queue, images_dict, layout_results_dict, save_visualization, vis_output_dir, global_start_idx)
+        original_put = region_queue.put
+
+        def patched_put(item: Any, *args: Any, **kwargs: Any):
+            if isinstance(item, tuple) and item and item[0] == "region":
+                increment_progress_state(progress_state, "regions_total", 1)
+            return original_put(item, *args, **kwargs)
+
+        region_queue.put = patched_put
+        try:
+            original_layout_batch(
+                batch_images,
+                batch_indices,
+                region_queue,
+                images_dict,
+                layout_results_dict,
+                save_visualization,
+                vis_output_dir,
+                global_start_idx,
+            )
+        finally:
+            region_queue.put = original_put
         batch_region_count = 0
+        page_region_updates: list[tuple[int, int]] = []
         for img_idx in batch_indices:
-            batch_region_count += len(layout_results_dict.get(img_idx, []))
-        progress_state["layout_pages_done"] += len(batch_indices)
-        progress_state["regions_total"] += batch_region_count
+            region_count = len(layout_results_dict.get(img_idx, []))
+            batch_region_count += region_count
+            page_no = int(img_idx) + 1
+            page_region_updates.append((page_no, region_count))
+        with progress_state["_lock"]:
+            per_page_regions = dict(progress_state.get("per_page_regions", {}))
+            for page_no, region_count in page_region_updates:
+                per_page_regions[page_no] = int(region_count)
+            progress_state["per_page_regions"] = per_page_regions
+            current_page_hint = int(progress_state.get("current_page_hint", 1))
+            if int(progress_state.get("current_page_region_total", 0)) <= 0 and current_page_hint in per_page_regions:
+                progress_state["current_page_region_total"] = int(per_page_regions[current_page_hint])
+            progress_state["last_event_at"] = time.time()
+        snapshot = increment_progress_state(
+            progress_state, "layout_pages_done", len(batch_indices)
+        )
+        if snapshot["layout_pages_done"] > snapshot["pages_total"]:
+            snapshot = update_progress_state(
+                progress_state,
+                layout_pages_done=snapshot["pages_total"],
+                phase="running",
+                last_backend_activity_at=time.time(),
+            )
+        else:
+            snapshot = update_progress_state(
+                progress_state,
+                phase="running",
+                last_backend_activity_at=time.time(),
+            )
         emit(
             "layout_batch_done",
             batch_pages=len(batch_indices),
             batch_regions=batch_region_count,
         )
+        for page_no, region_count in page_region_updates:
+            emit(
+                "page_region_metrics",
+                page=page_no,
+                regions=region_count,
+            )
 
     def patched_ocr_process(request_data: dict[str, Any]):
-        response, status_code = original_ocr_process(request_data)
-        progress_state["regions_done"] += 1
-        emit("region_done", regions_done=progress_state["regions_done"])
+        with progress_state["_lock"]:
+            progress_state["request_seq"] = int(progress_state.get("request_seq", 0)) + 1
+            request_seq = int(progress_state["request_seq"])
+            page_hint = min(
+                int(progress_state.get("pages_total", 1)),
+                int(progress_state.get("pages_done", 0)) + 1,
+            )
+            per_page_regions = dict(progress_state.get("per_page_regions", {}))
+            request_id = f"{task_id}_req_{request_seq:05d}"
+            progress_state["current_request_id"] = request_id
+            progress_state["current_page_hint"] = page_hint
+            if int(progress_state.get("current_page_region_total", 0)) <= 0 and page_hint in per_page_regions:
+                progress_state["current_page_region_total"] = int(per_page_regions[page_hint])
+            progress_state["last_event_at"] = time.time()
+
+        request_data = dict(request_data)
+        request_data["trace_task_id"] = task_id
+        request_data["trace_request_id"] = request_id
+        request_data["trace_page"] = page_hint
+        request_data["trace_region"] = request_seq
+        request_data["trace_stage"] = "ocr_request"
+        wait_started_at = time.time()
+        stop_wait = threading.Event()
+
+        def backend_wait_watcher() -> None:
+            thresholds = (10, 60, 120, 240)
+            emitted_thresholds: set[int] = set()
+            while not stop_wait.wait(1.0):
+                elapsed_wait = int(time.time() - wait_started_at)
+                for threshold in thresholds:
+                    if elapsed_wait < threshold or threshold in emitted_thresholds:
+                        continue
+                    emitted_thresholds.add(threshold)
+                    phase = "backend_wait"
+                    snapshot = update_progress_state(
+                        progress_state,
+                        phase=phase,
+                        backend_wait_started_at=wait_started_at,
+                    )
+                    emit(
+                        "backend_wait",
+                        service=f"{SELFHOSTED_HOST}:{SELFHOSTED_PORT}",
+                        phase_name="ocr_request",
+                        request_id=request_id,
+                        page=page_hint,
+                        region=request_seq,
+                        elapsed_wait=elapsed_wait,
+                        progress_state=snapshot,
+                    )
+
+        watcher = threading.Thread(target=backend_wait_watcher, daemon=True)
+        watcher.start()
+        try:
+            response, status_code = original_ocr_process(request_data)
+        finally:
+            stop_wait.set()
+            watcher.join(timeout=0.2)
+
+        current_time = time.time()
+        if status_code == 200:
+            snapshot = increment_progress_state(progress_state, "regions_done", 1)
+            if int(snapshot.get("regions_total", 0)) < int(snapshot.get("regions_done", 0)):
+                snapshot = update_progress_state(
+                    progress_state,
+                    regions_total=int(snapshot.get("regions_done", 0)),
+                )
+            with progress_state["_lock"]:
+                progress_state["current_page_region_done"] = int(progress_state.get("current_page_region_done", 0)) + 1
+                progress_state["last_event_at"] = time.time()
+            snapshot = update_progress_state(
+                progress_state,
+                phase="running",
+                backend_wait_started_at=None,
+                last_backend_activity_at=current_time,
+            )
+            emit("region_done", regions_done=snapshot["regions_done"])
+            return response, status_code
+
+        error_text = str(response.get("error") or response)
+        timeout_info = extract_backend_timeout_details(error_text)
+        if timeout_info:
+            snapshot = update_progress_state(
+                progress_state,
+                phase="failed",
+                backend_wait_started_at=wait_started_at,
+                failure_reason="本地 OCR 服务请求超时",
+                failure_stage="等待本地 OCR 服务超时",
+                last_backend_activity_at=current_time,
+            )
+            emit(
+                "backend_timeout",
+                service=timeout_info["service"],
+                timeout_seconds=timeout_info["timeout_seconds"],
+                phase_name="ocr_request",
+                request_id=request_id,
+                page=page_hint,
+                region=request_seq,
+                error=error_text,
+                progress_state=snapshot,
+            )
+        else:
+            snapshot = update_progress_state(
+                progress_state,
+                phase="failed",
+                failure_reason=error_text,
+                failure_stage="OCR 请求失败",
+                last_backend_activity_at=current_time,
+            )
+            emit(
+                "backend_failure",
+                service=f"{SELFHOSTED_HOST}:{SELFHOSTED_PORT}",
+                phase_name="ocr_request",
+                request_id=request_id,
+                page=page_hint,
+                region=request_seq,
+                error=error_text,
+                progress_state=snapshot,
+            )
         return response, status_code
+
+    def patched_process(self, *args: Any, **kwargs: Any):
+        for result in original_process(*args, **kwargs):
+            snapshot = increment_progress_state(progress_state, "pages_done", 1)
+            with progress_state["_lock"]:
+                next_page = min(
+                    int(progress_state.get("pages_total", 1)),
+                    int(progress_state.get("pages_done", 0)) + 1,
+                )
+                per_page_regions = dict(progress_state.get("per_page_regions", {}))
+                progress_state["current_page_hint"] = next_page
+                progress_state["current_page_region_done"] = 0
+                progress_state["current_page_region_total"] = int(per_page_regions.get(next_page, 0))
+                progress_state["last_event_at"] = time.time()
+            snapshot = update_progress_state(
+                progress_state,
+                phase="running",
+                last_backend_activity_at=time.time(),
+            )
+            emit("page_done", pages_done=snapshot["pages_done"])
+            yield result
 
     pipeline.page_loader.iter_pages_with_unit_indices = patched_iter_pages_with_unit_indices
     pipeline._stream_process_layout_batch = MethodType(patched_stream_process_layout_batch, pipeline)
     pipeline.ocr_client.process = patched_ocr_process
+    pipeline.process = MethodType(patched_process, pipeline)
 
     try:
         yield progress_state
@@ -277,6 +902,7 @@ def install_selfhosted_progress_hooks(
         pipeline.page_loader.iter_pages_with_unit_indices = original_iter
         pipeline._stream_process_layout_batch = original_layout_batch
         pipeline.ocr_client.process = original_ocr_process
+        pipeline.process = original_process
 
 
 def append_app_log(message: str) -> None:
@@ -284,6 +910,46 @@ def append_app_log(message: str) -> None:
     APP_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with APP_LOG_FILE.open("a", encoding="utf-8") as handle:
         handle.write(f"[{timestamp}] {message}\n")
+
+
+def format_elapsed_compact(seconds: float) -> str:
+    total = max(0, int(round(float(seconds))))
+    minutes, sec = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
+def build_task_id() -> str:
+    return f"ocr_{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}"
+
+
+def summarize_task_inputs(paths: list[str], limit: int = 3) -> str:
+    names = [Path(path).name for path in paths[:limit]]
+    if len(paths) > limit:
+        names.append(f"+{len(paths) - limit} more")
+    return ", ".join(names)
+
+
+def append_runtime_log(
+    level: str,
+    event: str,
+    *,
+    state: dict[str, Any] | None = None,
+    include_in_gui: bool = True,
+    **fields: Any,
+) -> str:
+    parts = [f"[{level}] {event}"]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        parts.append(f"{key}={value}")
+    message = " | ".join(parts)
+    append_app_log(message)
+    if include_in_gui and state is not None:
+        state["log_lines"].append(message)
+    return message
 
 
 def needs_ascii_staging(file_path: str) -> bool:
@@ -299,8 +965,291 @@ def stage_input_for_parser(file_path: str, staging_dir: Path, index: int) -> str
     return str(staged_path)
 
 
+def normalize_combined_markdown_page(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+
+    normalized_lines: list[str] = []
+    last_nonempty = ""
+    page_marker_re = re.compile(r"^\s*第\s*\d+\s*页\s*[-:：]?\s*$")
+
+    for raw_line in text.split("\n"):
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        # Drop standalone page markers that make the merged Markdown look artificial.
+        if stripped and page_marker_re.match(stripped):
+            continue
+
+        if not stripped:
+            if normalized_lines and normalized_lines[-1] == "":
+                continue
+            normalized_lines.append("")
+            continue
+
+        # Drop obvious duplicate title/header lines introduced by page stitching.
+        if stripped == last_nonempty and (stripped.startswith("#") or len(stripped) <= 80):
+            continue
+
+        normalized_lines.append(line)
+        last_nonempty = stripped
+
+    while normalized_lines and normalized_lines[0] == "":
+        normalized_lines.pop(0)
+    while normalized_lines and normalized_lines[-1] == "":
+        normalized_lines.pop()
+
+    return "\n".join(normalized_lines).strip()
+
+
+def should_merge_broken_paragraph(previous_paragraph: str, next_paragraph: str) -> bool:
+    prev = previous_paragraph.strip()
+    nxt = next_paragraph.strip()
+    if not prev or not nxt:
+        return False
+
+    if prev.startswith("#") or nxt.startswith("#"):
+        return False
+    if re.match(r"^\[[0-9]+\]", nxt) or re.match(r"^[0-9]{1,2}[.．、]", nxt):
+        return False
+
+    sentence_endings = "。！？!?：:；;"
+    if prev[-1] in sentence_endings:
+        return False
+
+    # Typical page-break leftovers are short tail fragments like "我觉得将它"
+    # followed by a normal paragraph continuing the same sentence.
+    if len(prev) <= 40:
+        return True
+
+    # Some OCR outputs split a paragraph into two blocks where the first block
+    # ends without punctuation and the next block begins with a continuation.
+    continuation_start_re = re.compile(r"^[\u4e00-\u9fffA-Za-z0-9“\"'‘（(]")
+    if len(prev) <= 120 and continuation_start_re.match(nxt):
+        return True
+
+    return False
+
+
+def merge_broken_paragraphs(text: str) -> str:
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    if not paragraphs:
+        return ""
+
+    merged: list[str] = []
+    for paragraph in paragraphs:
+        if merged and should_merge_broken_paragraph(merged[-1], paragraph):
+            merged[-1] = f"{merged[-1].rstrip()}{paragraph.lstrip()}"
+        else:
+            merged.append(paragraph)
+    return "\n\n".join(merged).strip()
+
+
+def build_combined_markdown(page_markdown_parts: list[str]) -> str:
+    cleaned_parts = [
+        cleaned
+        for cleaned in (normalize_combined_markdown_page(part) for part in page_markdown_parts)
+        if cleaned
+    ]
+    combined = "\n\n".join(cleaned_parts).strip()
+    combined = merge_broken_paragraphs(combined)
+    combined = re.sub(r"\n{3,}", "\n\n", combined)
+    return combined
+
+
+def list_listening_pids_on_port(host: str, port: int) -> list[int]:
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+    except Exception:
+        return []
+
+    pids: list[int] = []
+    host_candidates = {host, "0.0.0.0", "[::]", "::", "127.0.0.1", "localhost"}
+    suffix = f":{port}"
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if "LISTENING" not in line.upper():
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        local_address = parts[1]
+        pid_text = parts[-1]
+        if not local_address.endswith(suffix):
+            continue
+        local_host = local_address[: -len(suffix)]
+        if local_host not in host_candidates:
+            continue
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid > 0 and pid not in pids:
+            pids.append(pid)
+    return pids
+
+
+def stop_processes_on_port(host: str, port: int) -> list[int]:
+    stopped: list[int] = []
+    for pid in list_listening_pids_on_port(host, port):
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            else:
+                subprocess.run(["kill", "-9", str(pid)], check=False)
+            stopped.append(pid)
+        except Exception:
+            continue
+    return stopped
+
+
+def spawn_selfhosted_server_with_env(extra_env: dict[str, str] | None = None) -> None:
+    if is_port_open(SELFHOSTED_HOST, SELFHOSTED_PORT):
+        return
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    env = os.environ.copy()
+    if extra_env:
+        env.update({key: str(value) for key, value in extra_env.items() if value is not None})
+    SELFHOSTED_SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    server_log_handle = SELFHOSTED_SERVER_LOG_FILE.open("a", encoding="utf-8")
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(APP_ROOT / "glm_ocr_local_server.py"),
+                "--host",
+                SELFHOSTED_HOST,
+                "--port",
+                str(SELFHOSTED_PORT),
+            ],
+            cwd=str(APP_ROOT),
+            creationflags=creationflags,
+            env=env,
+            stdout=server_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+    finally:
+        server_log_handle.close()
+
+
+def restart_selfhosted_server(
+    progress,
+    *,
+    task_id: str | None = None,
+    state: dict[str, Any] | None = None,
+    reason: str = "",
+    max_new_tokens_cap: int | None = None,
+) -> None:
+    append_runtime_log(
+        "WARN",
+        "backend restart start",
+        state=state,
+        task_id=task_id,
+        host=SELFHOSTED_HOST,
+        port=SELFHOSTED_PORT,
+        reason=reason or "selfhosted recovery",
+        max_tokens_cap=max_new_tokens_cap,
+        phase="backend_restart",
+    )
+    stopped_pids = stop_processes_on_port(SELFHOSTED_HOST, SELFHOSTED_PORT)
+    append_runtime_log(
+        "INFO",
+        "backend restart stop",
+        state=state,
+        task_id=task_id,
+        host=SELFHOSTED_HOST,
+        port=SELFHOSTED_PORT,
+        stopped_pids=",".join(str(pid) for pid in stopped_pids) if stopped_pids else None,
+        phase="backend_restart",
+    )
+    progress(0, desc=f"重启本地 GLM-OCR 服务 {SELFHOSTED_HOST}:{SELFHOSTED_PORT}")
+    extra_env = {}
+    if max_new_tokens_cap is not None:
+        extra_env["GLMOCR_MAX_NEW_TOKENS"] = str(max_new_tokens_cap)
+    spawn_selfhosted_server_with_env(extra_env or None)
+    wait_for_local_server(
+        SELFHOSTED_HOST,
+        SELFHOSTED_PORT,
+        task_id=task_id,
+        state=state,
+    )
+    append_runtime_log(
+        "INFO",
+        "backend restart done",
+        state=state,
+        task_id=task_id,
+        host=SELFHOSTED_HOST,
+        port=SELFHOSTED_PORT,
+        max_tokens_cap=max_new_tokens_cap,
+        phase="backend_ready",
+    )
+
+
+def write_selfhosted_partial_report(
+    saved_dir: Path,
+    *,
+    file_path: str,
+    page_markdown_parts: list[str],
+    page_json_payloads: list[dict[str, Any]],
+    page_failures: list[dict[str, Any]],
+    page_start_number: int | None = None,
+    page_end_number: int | None = None,
+) -> tuple[Path, Path, Path]:
+    saved_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = saved_dir / "combined_pages.md"
+    markdown_text = build_combined_markdown(page_markdown_parts)
+    markdown_path.write_text(markdown_text, encoding="utf-8")
+    source_name = sanitize_output_name(Path(file_path).stem)
+    if page_start_number is not None and page_end_number is not None:
+        named_markdown_path = saved_dir / f"{source_name}_{page_start_number}-{page_end_number}_完整.md"
+    else:
+        named_markdown_path = saved_dir / f"{source_name}_完整.md"
+    named_markdown_path.write_text(markdown_text, encoding="utf-8")
+    report_path = saved_dir / "partial_report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "input_file": file_path,
+                "page_start_number": page_start_number,
+                "page_end_number": page_end_number,
+                "combined_markdown": str(named_markdown_path),
+                "completed_pages": [payload.get("page") for payload in page_json_payloads],
+                "failed_pages": page_failures,
+                "pages": page_json_payloads,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return markdown_path, named_markdown_path, report_path
+
+
 def build_error_outputs(error_msg: str, traceback_text: str = "") -> tuple[str, str, str, str, list[str], str]:
-    progress_html = render_progress("错误", 0.0, "预计剩余时间: 计算中")
+    error_view = summarize_error_for_ui_v2(error_msg, traceback_text)
+    progress_html = render_progress(
+        "当前进度：任务失败",
+        0.0,
+        "剩余时间：0 秒",
+        error_view["stage"],
+    )
     json_text = json.dumps(
         {
             "error": error_msg,
@@ -310,23 +1259,27 @@ def build_error_outputs(error_msg: str, traceback_text: str = "") -> tuple[str, 
         indent=2,
     )
     logs_text = traceback_text or error_msg
-    return f"错误: {error_msg}", "", json_text, logs_text, [], progress_html
+    return error_view["detail"], "", json_text, logs_text, [], progress_html
 
 
-def format_eta(seconds: float | None) -> str:
+def format_remaining_time(seconds: float | None) -> str:
     if seconds is None:
-        return "预计剩余时间: 计算中"
+        return "剩余时间：计算中"
     seconds = max(0.0, float(seconds))
     if seconds < 1:
-        return "预计剩余时间: < 1 秒"
+        return "剩余时间：< 1 秒"
     total = int(round(seconds))
     minutes, sec = divmod(total, 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
-        return f"预计剩余时间: {hours} 小时 {minutes} 分 {sec} 秒"
+        return f"剩余时间：{hours} 小时 {minutes} 分 {sec} 秒"
     if minutes:
-        return f"预计剩余时间: {minutes} 分 {sec} 秒"
-    return f"预计剩余时间: {sec} 秒"
+        return f"剩余时间：{minutes} 分 {sec} 秒"
+    return f"剩余时间：{sec} 秒"
+
+
+def format_eta(seconds: float | None) -> str:
+    return format_remaining_time(seconds)
 
 
 def build_summary(file_path: str, saved_dir: Path, result_dict: dict[str, Any]) -> str:
@@ -361,8 +1314,29 @@ def find_available_port(host: str, preferred_port: int, search_limit: int = 20) 
     )
 
 
-def wait_for_local_server(host: str, port: int, timeout: int = 180) -> None:
+def wait_for_local_server(
+    host: str,
+    port: int,
+    timeout: int = 180,
+    *,
+    task_id: str | None = None,
+    state: dict[str, Any] | None = None,
+) -> None:
     start = time.time()
+    warning_marks = (15, 30, 60, 120)
+    emitted_marks: set[int] = set()
+    last_health_error = ""
+    append_runtime_log(
+        "INFO",
+        "backend wait start",
+        state=state,
+        task_id=task_id,
+        host=host,
+        port=port,
+        timeout=f"{timeout}s",
+        phase="backend_wait",
+        reason="waiting for selfhosted backend",
+    )
     while time.time() - start < timeout:
         if is_port_open(host, port):
             try:
@@ -372,20 +1346,91 @@ def wait_for_local_server(host: str, port: int, timeout: int = 180) -> None:
                     proxies={"http": None, "https": None},
                 )
                 if response.ok:
+                    append_runtime_log(
+                        "INFO",
+                        "backend wait ready",
+                        state=state,
+                        task_id=task_id,
+                        host=host,
+                        port=port,
+                        elapsed=format_elapsed_compact(time.time() - start),
+                        phase="backend_ready",
+                    )
                     return
-            except Exception:
-                pass
+            except Exception as exc:
+                last_health_error = str(exc)
+        elapsed_wait = int(time.time() - start)
+        for mark in warning_marks:
+            if elapsed_wait < mark or mark in emitted_marks:
+                continue
+            emitted_marks.add(mark)
+            append_runtime_log(
+                "WARN",
+                "backend wait slow",
+                state=state,
+                task_id=task_id,
+                host=host,
+                port=port,
+                elapsed_wait=f"{elapsed_wait}s",
+                timeout=f"{timeout}s",
+                phase="backend_wait",
+                error=last_health_error or None,
+            )
         time.sleep(2)
-    raise gr.Error(f"本地 GLM-OCR 服务未能在 {timeout} 秒内启动成功。")
+    elapsed = format_elapsed_compact(time.time() - start)
+    append_runtime_log(
+        "ERROR",
+        "backend wait timeout",
+        state=state,
+        task_id=task_id,
+        host=host,
+        port=port,
+        timeout=f"{timeout}s",
+        elapsed=elapsed,
+        phase="backend_wait",
+        error=last_health_error or "backend health check timed out",
+    )
+    raise gr.Error(
+        f"本地 GLM-OCR 服务等待超时：{host}:{port} 在 {timeout} 秒内未就绪。"
+    )
 
 
-def ensure_selfhosted_server(progress) -> None:
+def ensure_selfhosted_server(
+    progress,
+    *,
+    task_id: str | None = None,
+    state: dict[str, Any] | None = None,
+) -> None:
     if is_port_open(SELFHOSTED_HOST, SELFHOSTED_PORT):
+        append_runtime_log(
+            "INFO",
+            "backend ready",
+            state=state,
+            task_id=task_id,
+            host=SELFHOSTED_HOST,
+            port=SELFHOSTED_PORT,
+            phase="backend_ready",
+            already_running=True,
+        )
         return
 
-    progress(0, desc="启动本地 GLM-OCR 服务")
+    progress(0, desc=f"等待本地 GLM-OCR 服务 {SELFHOSTED_HOST}:{SELFHOSTED_PORT}")
+    append_runtime_log(
+        "INFO",
+        "backend spawn start",
+        state=state,
+        task_id=task_id,
+        host=SELFHOSTED_HOST,
+        port=SELFHOSTED_PORT,
+        phase="backend_spawn",
+    )
     spawn_selfhosted_server()
-    wait_for_local_server(SELFHOSTED_HOST, SELFHOSTED_PORT)
+    wait_for_local_server(
+        SELFHOSTED_HOST,
+        SELFHOSTED_PORT,
+        task_id=task_id,
+        state=state,
+    )
 
 
 def spawn_selfhosted_server() -> None:
@@ -543,6 +1588,253 @@ def update_mode_visibility(mode_value: str) -> tuple[dict[str, Any], dict[str, A
     )
 
 
+def process_selfhosted_rendered_pages(
+    *,
+    parser_kwargs: dict[str, Any],
+    file_path: str,
+    page_images: list[str],
+    pages_total: int,
+    page_start_number: int,
+    page_end_number: int | None,
+    file_index: int,
+    task_id: str,
+    event_queue: queue.Queue,
+    state: dict[str, Any],
+    output_root: Path,
+    save_layout_visualization: bool,
+    progress,
+) -> tuple[Path, dict[str, Any], list[Path]]:
+    saved_dir = expected_saved_dir(output_root, file_path)
+    saved_dir.mkdir(parents=True, exist_ok=True)
+
+    page_markdown_parts: list[str] = []
+    page_json_payloads: list[dict[str, Any]] = []
+    page_failures: list[dict[str, Any]] = []
+    download_paths: list[Path] = []
+
+    degraded_caps = (None, 2048, 1024)
+    completed_pages = 0
+
+    def push_event(event_type: str, **payload: Any) -> None:
+        event_queue.put(
+            {
+                "type": event_type,
+                "index": file_index,
+                "file_path": file_path,
+                **payload,
+            }
+        )
+
+    for page_offset, page_image in enumerate(page_images):
+        actual_page = page_start_number + page_offset
+        page_success = False
+        last_error = ""
+        max_attempts = len(degraded_caps)
+
+        for attempt_no, cap in enumerate(degraded_caps, start=1):
+            push_event(
+                "page_attempt",
+                page=actual_page,
+                attempt=attempt_no,
+                max_attempts=max_attempts,
+                max_tokens_cap=cap,
+                pages_done=completed_pages,
+                pages_total=pages_total,
+            )
+            try:
+                with GlmOcr(**parser_kwargs) as page_parser:
+                    with install_selfhosted_progress_hooks(
+                        page_parser,
+                        event_queue,
+                        task_id,
+                        file_index,
+                        file_path,
+                        pages_total,
+                        initial_pages_done=completed_pages,
+                        initial_pages_loaded=completed_pages,
+                        initial_layout_pages_done=completed_pages,
+                        initial_page_hint=actual_page,
+                    ) as progress_state:
+                        parse_watch_stop = threading.Event()
+
+                        def parse_stage_watcher() -> None:
+                            milestones = (
+                                (0, "parse_prepare_start"),
+                                (2, "pdf_opened"),
+                                (6, "page_render_start"),
+                                (10, "first_page_wait"),
+                            )
+                            emitted: set[str] = set()
+                            while not parse_watch_stop.wait(1.0):
+                                snapshot = snapshot_progress_state(progress_state)
+                                if (
+                                    snapshot.get("pages_loaded", 0) > completed_pages
+                                    or snapshot.get("layout_pages_done", 0) > completed_pages
+                                    or snapshot.get("regions_done", 0) > 0
+                                    or snapshot.get("parse_done")
+                                    or snapshot.get("save_done")
+                                    or snapshot.get("failure_reason")
+                                ):
+                                    break
+                                elapsed_wait = int(time.time() - snapshot.get("started_at", time.time()))
+                                for threshold, phase_name in milestones:
+                                    if elapsed_wait < threshold or phase_name in emitted:
+                                        continue
+                                    emitted.add(phase_name)
+                                    stage_snapshot = update_progress_state(
+                                        progress_state,
+                                        phase=phase_name,
+                                        current_page_hint=actual_page,
+                                        last_backend_activity_at=time.time(),
+                                    )
+                                    push_event(
+                                        "stage",
+                                        phase_name=phase_name,
+                                        progress_state=stage_snapshot,
+                                    )
+
+                        initial_stage_snapshot = update_progress_state(
+                            progress_state,
+                            phase="parse_prepare_start",
+                            current_page_hint=actual_page,
+                            last_backend_activity_at=time.time(),
+                        )
+                        push_event(
+                            "stage",
+                            phase_name="parse_prepare_start",
+                            progress_state=initial_stage_snapshot,
+                        )
+                        parse_watcher = threading.Thread(target=parse_stage_watcher, daemon=True)
+                        parse_watcher.start()
+                        try:
+                            result = page_parser.parse([page_image], save_layout_visualization=save_layout_visualization)
+                        finally:
+                            parse_watch_stop.set()
+                            parse_watcher.join(timeout=0.2)
+                        parse_snapshot = update_progress_state(progress_state, parse_done=True)
+                        push_event("parse_done", progress_state=parse_snapshot)
+
+                page_result = result[0] if isinstance(result, list) else result
+                page_output_dir = saved_dir / f"page_{actual_page:04d}"
+                page_output_dir.mkdir(parents=True, exist_ok=True)
+                page_result.save(
+                    output_dir=page_output_dir,
+                    save_layout_visualization=save_layout_visualization,
+                )
+                saved_files = collect_saved_artifacts(page_output_dir)
+                download_paths.extend(saved_files)
+                result_dict = page_result.to_dict()
+                page_markdown_parts.append((result_dict.get("markdown_result") or "").strip())
+                page_json_payloads.append(
+                    {
+                        "page": actual_page,
+                        "saved_dir": str(page_output_dir),
+                        "result": result_dict,
+                    }
+                )
+                completed_pages += 1
+                push_event(
+                    "save_done",
+                    progress_state={
+                        "pages_total": pages_total,
+                        "pages_done": completed_pages,
+                        "pages_loaded": completed_pages,
+                        "layout_pages_done": completed_pages,
+                        "regions_total": 0,
+                        "regions_done": 0,
+                        "parse_done": True,
+                        "save_done": True,
+                        "phase": "finished",
+                        "current_page_hint": min(page_start_number + page_offset + 1, page_start_number + pages_total - 1),
+                        "started_at": time.time(),
+                        "last_event_at": time.time(),
+                    },
+                    saved_dir=str(page_output_dir),
+                )
+                page_success = True
+                break
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                retryable = is_selfhosted_timeout_error(exc) or "127.0.0.1:5002" in last_error
+                if attempt_no >= max_attempts or not retryable:
+                    push_event(
+                        "page_failure",
+                        page=actual_page,
+                        attempt=attempt_no,
+                        max_attempts=max_attempts,
+                        error=last_error,
+                        pages_done=completed_pages,
+                        pages_total=pages_total,
+                    )
+                    page_failures.append(
+                        {
+                            "page": actual_page,
+                            "attempts": attempt_no,
+                            "error": last_error,
+                            "max_tokens_cap": cap,
+                        }
+                    )
+                    break
+
+                push_event(
+                    "page_retry",
+                    page=actual_page,
+                    attempt=attempt_no + 1,
+                    max_attempts=max_attempts,
+                    error=last_error,
+                    max_tokens_cap=degraded_caps[attempt_no],
+                    pages_done=completed_pages,
+                    pages_total=pages_total,
+                )
+                push_event(
+                    "service_restart",
+                    page=actual_page,
+                    attempt=attempt_no + 1,
+                    max_attempts=max_attempts,
+                    reason=last_error,
+                    max_tokens_cap=degraded_caps[attempt_no],
+                    pages_done=completed_pages,
+                    pages_total=pages_total,
+                )
+                restart_selfhosted_server(
+                    progress,
+                    task_id=task_id,
+                    state=state,
+                    reason=f"page={actual_page} retry={attempt_no + 1}",
+                    max_new_tokens_cap=degraded_caps[attempt_no],
+                )
+
+        if not page_success:
+            continue
+
+    markdown_path, named_markdown_path, report_path = write_selfhosted_partial_report(
+        saved_dir,
+        file_path=file_path,
+        page_markdown_parts=page_markdown_parts,
+        page_json_payloads=page_json_payloads,
+        page_failures=page_failures,
+        page_start_number=page_start_number,
+        page_end_number=page_end_number,
+    )
+    download_paths.extend([markdown_path, named_markdown_path, report_path])
+
+    aggregate_result = {
+        "markdown_result": build_combined_markdown(page_markdown_parts),
+        "json_result": {
+            "completed_pages": [item["page"] for item in page_json_payloads],
+            "failed_pages": page_failures,
+            "pages": page_json_payloads,
+        },
+        "usage": None,
+        "error": None if not page_failures else f"{len(page_failures)} pages failed after retries",
+    }
+    if not page_json_payloads:
+        raise RuntimeError(
+            f"Selfhosted page processing produced no successful pages. Last error: {last_error}"
+        )
+    return saved_dir, aggregate_result, download_paths
+
+
 def run_ocr(
     files: list[Any],
     mode: str,
@@ -555,6 +1847,8 @@ def run_ocr(
     end_page: str,
     progress=gr.Progress(track_tqdm=False),
 ):
+    task_id = build_task_id()
+    task_started_at = time.time()
     try:
         append_app_log("run_ocr precheck start")
         api_key_text = normalize_optional_text(api_key)
@@ -565,7 +1859,11 @@ def run_ocr(
         end_page_text = normalize_optional_text(end_page)
 
         paths = collect_paths(files)
-        workload = estimate_units(paths)
+        start_page_id = parse_optional_int(start_page_text, "PDF 起始页")
+        end_page_id = parse_optional_int(end_page_text, "PDF 结束页")
+        if start_page_id and end_page_id and start_page_id > end_page_id:
+            raise gr.Error("PDF 起始页不能大于结束页。")
+        workload = estimate_units(paths, start_page_id, end_page_id)
         output_root = Path(output_dir_text or DEFAULT_OUTPUT_DIR).resolve()
         output_root.mkdir(parents=True, exist_ok=True)
 
@@ -585,7 +1883,16 @@ def run_ocr(
         tb = traceback.format_exc()
         append_app_log(tb)
         error_msg = f"{type(exc).__name__}: {exc}"
-        yield build_error_outputs(error_msg, tb)
+        failure_log = append_runtime_log(
+            "ERROR",
+            "task end",
+            task_id=task_id,
+            status="failed",
+            elapsed=format_elapsed_compact(time.time() - task_started_at),
+            error=error_msg,
+            include_in_gui=False,
+        )
+        yield build_error_outputs(error_msg, f"{failure_log}\n{tb}")
         return
 
     try:
@@ -599,6 +1906,8 @@ def run_ocr(
 
         event_queue: queue.Queue = queue.Queue()
         state = {
+            "task_id": task_id,
+            "task_started_at": task_started_at,
             "summaries": [],
             "markdown_parts": [],
             "json_payloads": [],
@@ -608,28 +1917,95 @@ def run_ocr(
             "done": False,
             "saved_count": 0,
             "active_progress": {},
+            "current_progress": None,
+            "current_file_index": None,
         }
 
         def worker() -> None:
             staging_dir: Path | None = None
+            task_end_logged = False
+
+            def log_task_end(status: str, error: str | None = None) -> None:
+                nonlocal task_end_logged
+                if task_end_logged:
+                    return
+                task_end_logged = True
+                fields: dict[str, Any] = {
+                    "task_id": task_id,
+                    "status": status,
+                    "elapsed": format_elapsed_compact(time.time() - task_started_at),
+                }
+                if error:
+                    fields["error"] = error
+                append_runtime_log("INFO" if status == "success" else "ERROR", "task end", **fields)
+
             try:
+                total = len(paths)
+                total_items = int(sum(units for _, units in workload))
+                total_pages = total_items if total == 1 and Path(paths[0]).suffix.lower() == ".pdf" else None
+                append_runtime_log(
+                    "INFO",
+                    "task start",
+                    state=state,
+                    task_id=task_id,
+                    mode=mode,
+                    input=summarize_task_inputs(paths),
+                    total_files=total,
+                    total_items=total_items,
+                    total_pages=total_pages,
+                )
                 if mode == "selfhosted":
                     append_app_log("selfhosted preflight start")
-                    ensure_selfhosted_server(progress)
+                    ensure_selfhosted_server(progress, task_id=task_id, state=state)
                     parser_kwargs["ocr_api_host"] = SELFHOSTED_HOST
                     parser_kwargs["ocr_api_port"] = SELFHOSTED_PORT
-
-                total = len(paths)
                 append_app_log(f"run_ocr start mode={mode} files={len(paths)} output={output_root}")
-                parser_inputs: list[tuple[str, str]] = []
+                parser_inputs: list[tuple[str, str | list[str], dict[str, Any]]] = []
                 if mode == "selfhosted":
                     STAGING_ROOT.mkdir(parents=True, exist_ok=True)
                     staging_dir = Path(tempfile.mkdtemp(prefix="job_", dir=str(STAGING_ROOT)))
                     append_app_log(f"staging dir created {staging_dir}")
 
                 for index, file_path in enumerate(paths, start=1):
-                    parser_input_path = file_path
-                    if mode == "selfhosted" and staging_dir is not None and needs_ascii_staging(file_path):
+                    parser_input_path: str | list[str] = file_path
+                    parser_meta: dict[str, Any] = {}
+                    if mode == "selfhosted" and staging_dir is not None:
+                        suffix = Path(file_path).suffix.lower()
+                        if suffix == ".pdf":
+                            _, actual_start_page, actual_end_page, _ = resolve_pdf_page_range(
+                                Path(file_path),
+                                start_page_id,
+                                end_page_id,
+                            )
+                            parser_input_path, selected_pages = render_pdf_range_to_images(
+                                file_path,
+                                staging_dir,
+                                index,
+                                start_page_id,
+                                end_page_id,
+                            )
+                            parser_meta["page_start_number"] = actual_start_page
+                            parser_meta["page_end_number"] = actual_end_page
+                            if start_page_id is not None or end_page_id is not None:
+                                state["log_lines"].append(
+                                    f"[{index}/{total}] 已按页范围渲染 PDF：{Path(file_path).name} -> {selected_pages} 页"
+                                )
+                                append_app_log(
+                                    f"rendered pdf range original={file_path} staged_pages={selected_pages} first_image={parser_input_path[0] if parser_input_path else ''}"
+                                )
+                            else:
+                                state["log_lines"].append(
+                                    f"[{index}/{total}] 已为 selfhosted 模式逐页渲染 PDF：{Path(file_path).name} -> {selected_pages} 页"
+                                )
+                                append_app_log(
+                                    f"rendered pdf full original={file_path} staged_pages={selected_pages} first_image={parser_input_path[0] if parser_input_path else ''}"
+                                )
+                    if (
+                        mode == "selfhosted"
+                        and staging_dir is not None
+                        and isinstance(parser_input_path, str)
+                        and needs_ascii_staging(file_path)
+                    ):
                         parser_input_path = stage_input_for_parser(file_path, staging_dir, index)
                         state["log_lines"].append(
                             f"[{index}/{total}] 检测到非 ASCII 路径，已使用临时英文文件名处理"
@@ -637,12 +2013,11 @@ def run_ocr(
                         append_app_log(
                             f"staged input original={file_path} staged={parser_input_path}"
                         )
-                    parser_inputs.append((file_path, parser_input_path))
+                    parser_inputs.append((file_path, parser_input_path, parser_meta))
 
                 append_app_log("parser creation start")
-                with GlmOcr(**parser_kwargs) as parser:
-                    append_app_log("parser creation done")
-                    for index, (file_path, parser_input_path) in enumerate(parser_inputs, start=1):
+                append_app_log("parser creation done")
+                for index, (file_path, parser_input_path, parser_meta) in enumerate(parser_inputs, start=1):
                         pages_total = workload[index - 1][1]
                         event_queue.put(
                             {
@@ -653,6 +2028,34 @@ def run_ocr(
                                 "label": Path(file_path).name,
                                 "pages_total": pages_total,
                             }
+                        )
+                        append_runtime_log(
+                            "INFO",
+                            "task item start",
+                            state=state,
+                            task_id=task_id,
+                            item=index,
+                            total=total,
+                            input=Path(file_path).name,
+                            total_items=pages_total,
+                            total_pages=pages_total if Path(file_path).suffix.lower() == ".pdf" else None,
+                        )
+                        append_runtime_log(
+                            "INFO",
+                            "parse start",
+                            state=state,
+                            task_id=task_id,
+                            item=index,
+                            total=total,
+                            parser="GlmOcr",
+                            mode=mode,
+                            file=Path(file_path).name,
+                            input=(
+                                f"{len(parser_input_path)} rendered pages"
+                                if isinstance(parser_input_path, list)
+                                else Path(parser_input_path).name
+                            ),
+                            total_pages=pages_total,
                         )
                         append_app_log(f"parse start file={file_path} parser_input={parser_input_path}")
 
@@ -665,30 +2068,195 @@ def run_ocr(
                             if end_page_id is not None:
                                 parse_kwargs["end_page_id"] = end_page_id
 
-                        if mode == "selfhosted":
-                            with install_selfhosted_progress_hooks(
-                                parser,
-                                event_queue,
-                                index,
-                                file_path,
-                                pages_total,
-                            ) as progress_state:
-                                result = parser.parse(parser_input_path, **parse_kwargs)
-                                if progress_state is not None:
-                                    progress_state["parse_done"] = True
+                        if mode == "selfhosted" and isinstance(parser_input_path, list):
+                            saved_dir, result_dict, page_downloads = process_selfhosted_rendered_pages(
+                                parser_kwargs=parser_kwargs,
+                                file_path=file_path,
+                                page_images=parser_input_path,
+                                pages_total=pages_total,
+                                page_start_number=int(parser_meta.get("page_start_number", 1)),
+                                page_end_number=(
+                                    int(parser_meta["page_end_number"])
+                                    if parser_meta.get("page_end_number") is not None
+                                    else None
+                                ),
+                                file_index=index,
+                                task_id=task_id,
+                                event_queue=event_queue,
+                                state=state,
+                                output_root=output_root,
+                                save_layout_visualization=save_layout_visualization,
+                                progress=progress,
+                            )
+                            append_runtime_log(
+                                "INFO" if not result_dict.get("error") else "WARN",
+                                "parse end",
+                                state=state,
+                                task_id=task_id,
+                                item=index,
+                                total=total,
+                                file=Path(file_path).name,
+                                total_pages=pages_total,
+                                elapsed=format_elapsed_compact(time.time() - task_started_at),
+                                failed_pages=len(result_dict.get("json_result", {}).get("failed_pages", [])),
+                            )
+                            append_runtime_log(
+                                "INFO" if not result_dict.get("error") else "WARN",
+                                "save done",
+                                state=state,
+                                task_id=task_id,
+                                item=index,
+                                total=total,
+                                file=Path(file_path).name,
+                                saved_dir=str(saved_dir),
+                            )
+                            state["summaries"].append(build_summary(file_path, saved_dir, result_dict))
+                            state["markdown_parts"].append(
+                                f"# {Path(file_path).name}\n\n{result_dict.get('markdown_result') or ''}".strip()
+                            )
+                            state["json_payloads"].append(
+                                {
+                                    "input_file": file_path,
+                                    "saved_dir": str(saved_dir),
+                                    "result": result_dict,
+                                }
+                            )
+                            state["log_lines"].append(f"[{index}/{total}] Saved output: {saved_dir}")
+                            state["saved_count"] += 1
+                            for child in page_downloads:
+                                state["download_paths"].append(str(child))
+                            append_runtime_log(
+                                "INFO" if not result_dict.get("error") else "WARN",
+                                "task item end",
+                                state=state,
+                                task_id=task_id,
+                                item=index,
+                                total=total,
+                                status="success" if not result_dict.get("error") else "partial_failed",
+                                output=saved_dir,
+                            )
+                            event_queue.put(
+                                {
+                                    "type": "file_done",
+                                    "index": index,
+                                    "total": total,
+                                    "file_path": file_path,
+                                    "saved_dir": str(saved_dir),
+                                }
+                            )
+                            continue
+
+                        with GlmOcr(**parser_kwargs) as parser:
+                            if mode == "selfhosted":
+                                with install_selfhosted_progress_hooks(
+                                    parser,
+                                    event_queue,
+                                    task_id,
+                                    index,
+                                    file_path,
+                                    pages_total,
+                                ) as progress_state:
+                                    parse_watch_stop = threading.Event()
+
+                                    def parse_stage_watcher() -> None:
+                                        milestones = (
+                                            (0, "parse_prepare_start"),
+                                            (2, "pdf_opened"),
+                                            (6, "page_render_start"),
+                                            (10, "first_page_wait"),
+                                        )
+                                        emitted: set[str] = set()
+                                        while not parse_watch_stop.wait(1.0):
+                                            snapshot = snapshot_progress_state(progress_state)
+                                            if (
+                                                snapshot.get("pages_loaded", 0) > 0
+                                                or snapshot.get("layout_pages_done", 0) > 0
+                                                or snapshot.get("regions_done", 0) > 0
+                                                or snapshot.get("parse_done")
+                                                or snapshot.get("save_done")
+                                                or snapshot.get("failure_reason")
+                                            ):
+                                                break
+                                            elapsed_wait = int(time.time() - snapshot.get("started_at", task_started_at))
+                                            for threshold, phase_name in milestones:
+                                                if elapsed_wait < threshold or phase_name in emitted:
+                                                    continue
+                                                emitted.add(phase_name)
+                                                stage_snapshot = update_progress_state(
+                                                    progress_state,
+                                                    phase=phase_name,
+                                                    last_backend_activity_at=time.time(),
+                                                )
+                                                event_queue.put(
+                                                    {
+                                                        "type": "stage",
+                                                        "index": index,
+                                                        "file_path": file_path,
+                                                        "phase_name": phase_name,
+                                                        "progress_state": stage_snapshot,
+                                                    }
+                                                )
+
+                                    initial_stage_snapshot = update_progress_state(
+                                        progress_state,
+                                        phase="parse_prepare_start",
+                                        last_backend_activity_at=time.time(),
+                                    )
                                     event_queue.put(
                                         {
-                                            "type": "parse_done",
+                                            "type": "stage",
                                             "index": index,
                                             "file_path": file_path,
-                                            "progress_state": dict(progress_state),
+                                            "phase_name": "parse_prepare_start",
+                                            "progress_state": initial_stage_snapshot,
                                         }
                                     )
-                        else:
-                            result = parser.parse(parser_input_path, **parse_kwargs)
+                                    parse_watcher = threading.Thread(
+                                        target=parse_stage_watcher,
+                                        daemon=True,
+                                    )
+                                    parse_watcher.start()
+                                    try:
+                                        result = parser.parse(parser_input_path, **parse_kwargs)
+                                    finally:
+                                        parse_watch_stop.set()
+                                        parse_watcher.join(timeout=0.2)
+                                    if progress_state is not None:
+                                        parse_snapshot = update_progress_state(progress_state, parse_done=True)
+                                        event_queue.put(
+                                            {
+                                                "type": "parse_done",
+                                                "index": index,
+                                                "file_path": file_path,
+                                                "progress_state": parse_snapshot,
+                                            }
+                                        )
+                            else:
+                                result = parser.parse(parser_input_path, **parse_kwargs)
+                        append_runtime_log(
+                            "INFO",
+                            "parse end",
+                            state=state,
+                            task_id=task_id,
+                            item=index,
+                            total=total,
+                            file=Path(file_path).name,
+                            total_pages=pages_total,
+                            elapsed=format_elapsed_compact(time.time() - task_started_at),
+                        )
                         if getattr(result, "original_images", None):
                             result.original_images = [file_path]
 
+                        append_runtime_log(
+                            "INFO",
+                            "save start",
+                            state=state,
+                            task_id=task_id,
+                            item=index,
+                            total=total,
+                            file=Path(file_path).name,
+                            output_dir=str(output_root),
+                        )
                         append_app_log(f"result save start file={file_path}")
                         result.save(
                             output_dir=output_root,
@@ -705,6 +2273,16 @@ def run_ocr(
                             raise RuntimeError(
                                 f"No JSON or Markdown output was produced in: {saved_dir}"
                             )
+                        append_runtime_log(
+                            "INFO",
+                            "save done",
+                            state=state,
+                            task_id=task_id,
+                            item=index,
+                            total=total,
+                            file=Path(file_path).name,
+                            saved_dir=str(saved_dir),
+                        )
                         result_dict = result.to_dict()
                         state["summaries"].append(build_summary(file_path, saved_dir, result_dict))
                         state["markdown_parts"].append(
@@ -719,15 +2297,26 @@ def run_ocr(
                         )
                         state["log_lines"].append(f"[{index}/{total}] Saved output: {saved_dir}")
                         append_app_log(f"result save done file={file_path} saved_dir={saved_dir}")
+                        append_runtime_log(
+                            "INFO",
+                            "task item end",
+                            state=state,
+                            task_id=task_id,
+                            item=index,
+                            total=total,
+                            status="success",
+                            output=saved_dir,
+                        )
                         state["saved_count"] += 1
                         if mode == "selfhosted":
+                            progress_snapshot = state["active_progress"].get(index, {})
                             event_queue.put(
                                 {
                                     "type": "save_done",
                                     "index": index,
                                     "file_path": file_path,
                                     "progress_state": {
-                                        **state["active_progress"].get(index, {}),
+                                        **progress_snapshot,
                                         "pages_total": pages_total,
                                         "parse_done": True,
                                         "save_done": True,
@@ -748,17 +2337,31 @@ def run_ocr(
                                 "saved_dir": str(saved_dir),
                             }
                         )
+                log_task_end("success")
                 append_app_log("run_ocr finished successfully")
             except MissingApiKeyError as exc:
                 state["error"] = f"缺少 API Key: {exc}"
                 tb = traceback.format_exc()
                 state["log_lines"].append(tb)
                 append_app_log(tb)
+                log_task_end("failed", state["error"])
             except Exception as exc:
-                state["error"] = f"{type(exc).__name__}: {exc}"
+                state["error"] = summarize_task_failure(exc, mode)
                 tb = traceback.format_exc()
                 state["log_lines"].append(tb)
                 append_app_log(tb)
+                if mode == "selfhosted" and is_selfhosted_timeout_error(exc):
+                    append_runtime_log(
+                        "ERROR",
+                        "backend timeout",
+                        state=state,
+                        task_id=task_id,
+                        service=f"{SELFHOSTED_HOST}:{SELFHOSTED_PORT}",
+                        phase="ocr_request",
+                        timeout="300s",
+                        error=state["error"],
+                    )
+                log_task_end("failed", state["error"])
             finally:
                 if staging_dir is not None:
                     try:
@@ -774,10 +2377,16 @@ def run_ocr(
         total_units = sum(units for _, units in workload)
         completed_units = 0.0
         total_elapsed_start = time.time()
-        current_label = "初始化"
+        current_label = "当前进度：等待任务开始"
+        current_stage = "当前阶段：准备解析任务"
         total_units = max(1.0, float(total_units))
 
-        initial_progress = render_progress("初始化", 0.0, "预计剩余时间: 计算中")
+        initial_progress = render_progress(
+            current_label,
+            0.0,
+            "剩余时间：计算中",
+            current_stage,
+        )
         yield "", "", "", "", [], initial_progress
 
         while True:
@@ -788,54 +2397,368 @@ def run_ocr(
                     break
 
                 if event["type"] == "file_start":
-                    current_label = f"处理 {event['label']}"
+                    state["current_file_index"] = event["index"]
                     state["active_progress"][event["index"]] = {
                         "pages_total": event.get("pages_total", workload[event["index"] - 1][1]),
+                        "pages_done": 0,
                         "pages_loaded": 0,
                         "layout_pages_done": 0,
                         "regions_total": 0,
                         "regions_done": 0,
                         "parse_done": False,
                         "save_done": False,
+                        "phase": "preparing",
+                        "started_at": time.time(),
+                        "last_event_at": time.time(),
                     }
+                    state["current_progress"] = state["active_progress"][event["index"]]
+                    current_label, current_stage, _, _, _ = describe_selfhosted_progress(
+                        state["current_progress"]
+                    )
                     state["log_lines"].append(
                         f"[{event['index']}/{event['total']}] 开始处理 {event['file_path']}"
                     )
+                elif event["type"] == "stage":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    state["current_progress"] = event["progress_state"]
+                    snapshot = event["progress_state"]
+                    current_label, current_stage, phase, current_count, total_count = describe_selfhosted_progress(snapshot)
+                    append_runtime_log(
+                        "INFO",
+                        "stage",
+                        state=state,
+                        task_id=task_id,
+                        phase=phase,
+                        current=f"{current_count}",
+                        total=f"{total_count}",
+                    )
+                elif event["type"] == "backend_wait":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    state["current_progress"] = event["progress_state"]
+                    snapshot = event["progress_state"]
+                    current_label, current_stage, phase, current_count, total_count = describe_selfhosted_progress(snapshot)
+                    wait_level = "WARN" if int(event.get("elapsed_wait", 0)) >= 60 else "INFO"
+                    append_runtime_log(
+                        wait_level,
+                        "backend wait",
+                        state=state,
+                        task_id=task_id,
+                        service=event.get("service"),
+                        phase=event.get("phase_name", phase),
+                        request_id=event.get("request_id"),
+                        page=event.get("page"),
+                        region=event.get("region"),
+                        current=f"{current_count}",
+                        total=f"{total_count}",
+                        elapsed_wait=f"{int(event.get('elapsed_wait', 0))}s",
+                    )
+                elif event["type"] == "backend_timeout":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    state["current_progress"] = event["progress_state"]
+                    snapshot = event["progress_state"]
+                    current_label, current_stage, phase, current_count, total_count = describe_selfhosted_progress(snapshot)
+                    append_runtime_log(
+                        "ERROR",
+                        "backend timeout",
+                        state=state,
+                        task_id=task_id,
+                        service=event.get("service"),
+                        phase=event.get("phase_name", phase),
+                        request_id=event.get("request_id"),
+                        page=event.get("page"),
+                        region=event.get("region"),
+                        current=f"{current_count}",
+                        total=f"{total_count}",
+                        timeout=f"{event.get('timeout_seconds')}s",
+                        error=event.get("error"),
+                    )
+                elif event["type"] == "backend_failure":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    state["current_progress"] = event["progress_state"]
+                    snapshot = event["progress_state"]
+                    current_label, current_stage, phase, current_count, total_count = describe_selfhosted_progress(snapshot)
+                    append_runtime_log(
+                        "ERROR",
+                        "backend failure",
+                        state=state,
+                        task_id=task_id,
+                        service=event.get("service"),
+                        phase=event.get("phase_name", phase),
+                        request_id=event.get("request_id"),
+                        page=event.get("page"),
+                        region=event.get("region"),
+                        current=f"{current_count}",
+                        total=f"{total_count}",
+                        error=event.get("error"),
+                    )
+                elif event["type"] == "page_attempt":
+                    snapshot = dict(state["active_progress"].get(event["index"], {}) or {})
+                    snapshot.update(
+                        {
+                            "pages_total": event.get("pages_total", workload[event["index"] - 1][1]),
+                            "pages_done": event.get("pages_done", snapshot.get("pages_done", 0)),
+                            "phase": "running",
+                            "current_page_hint": event.get("page"),
+                            "last_event_at": time.time(),
+                        }
+                    )
+                    state["active_progress"][event["index"]] = snapshot
+                    state["current_progress"] = snapshot
+                    current_label = f"当前进度：{snapshot.get('pages_done', 0)} / {snapshot.get('pages_total', 1)} 页"
+                    current_stage = (
+                        f"当前阶段：正在处理第 {event.get('page')} 页"
+                        if int(event.get("attempt", 1)) == 1
+                        else f"当前阶段：正在重试第 {event.get('page')} 页（第 {event.get('attempt')}/{event.get('max_attempts')} 次）"
+                    )
+                    append_runtime_log(
+                        "INFO",
+                        "page attempt",
+                        state=state,
+                        task_id=task_id,
+                        page=event.get("page"),
+                        attempt=event.get("attempt"),
+                        max_attempts=event.get("max_attempts"),
+                        max_tokens_cap=event.get("max_tokens_cap"),
+                    )
+                elif event["type"] == "page_retry":
+                    snapshot = dict(state["active_progress"].get(event["index"], {}) or {})
+                    snapshot.update(
+                        {
+                            "pages_total": event.get("pages_total", workload[event["index"] - 1][1]),
+                            "pages_done": event.get("pages_done", snapshot.get("pages_done", 0)),
+                            "phase": "retrying",
+                            "current_page_hint": event.get("page"),
+                            "failure_reason": event.get("error"),
+                            "last_event_at": time.time(),
+                        }
+                    )
+                    state["active_progress"][event["index"]] = snapshot
+                    state["current_progress"] = snapshot
+                    current_label, _, _, _, _ = describe_selfhosted_progress(snapshot)
+                    current_stage = f"当前阶段：正在重试第 {event.get('page')} 页（第 {event.get('attempt')}/{event.get('max_attempts')} 次）"
+                    append_runtime_log(
+                        "WARN",
+                        "page retry",
+                        state=state,
+                        task_id=task_id,
+                        page=event.get("page"),
+                        attempt=event.get("attempt"),
+                        max_attempts=event.get("max_attempts"),
+                        max_tokens_cap=event.get("max_tokens_cap"),
+                        error=event.get("error"),
+                    )
+                elif event["type"] == "service_restart":
+                    snapshot = dict(state["active_progress"].get(event["index"], {}) or {})
+                    snapshot.update(
+                        {
+                            "pages_total": event.get("pages_total", workload[event["index"] - 1][1]),
+                            "pages_done": event.get("pages_done", snapshot.get("pages_done", 0)),
+                            "phase": "restarting_service",
+                            "current_page_hint": event.get("page"),
+                            "last_event_at": time.time(),
+                        }
+                    )
+                    state["active_progress"][event["index"]] = snapshot
+                    state["current_progress"] = snapshot
+                    current_label, _, _, _, _ = describe_selfhosted_progress(snapshot)
+                    current_stage = (
+                        f"当前阶段：正在重启本地 OCR 服务并重试第 {event.get('page')} 页"
+                    )
+                    append_runtime_log(
+                        "WARN",
+                        "service restart",
+                        state=state,
+                        task_id=task_id,
+                        page=event.get("page"),
+                        attempt=event.get("attempt"),
+                        max_attempts=event.get("max_attempts"),
+                        max_tokens_cap=event.get("max_tokens_cap"),
+                        reason=event.get("reason"),
+                    )
+                elif event["type"] == "page_failure":
+                    snapshot = dict(state["active_progress"].get(event["index"], {}) or {})
+                    snapshot.update(
+                        {
+                            "pages_total": event.get("pages_total", workload[event["index"] - 1][1]),
+                            "pages_done": event.get("pages_done", snapshot.get("pages_done", 0)),
+                            "phase": "page_failed",
+                            "current_page_hint": event.get("page"),
+                            "failure_reason": event.get("error"),
+                            "last_event_at": time.time(),
+                        }
+                    )
+                    state["active_progress"][event["index"]] = snapshot
+                    state["current_progress"] = snapshot
+                    current_label, _, _, _, _ = describe_selfhosted_progress(snapshot)
+                    current_stage = f"当前阶段：第 {event.get('page')} 页失败，继续后续页面"
+                    append_runtime_log(
+                        "ERROR",
+                        "page failure",
+                        state=state,
+                        task_id=task_id,
+                        page=event.get("page"),
+                        attempt=event.get("attempt"),
+                        max_attempts=event.get("max_attempts"),
+                        error=event.get("error"),
+                    )
                 elif event["type"] == "page_loaded":
                     state["active_progress"][event["index"]] = event["progress_state"]
-                    current_label = (
-                        f"加载页面 {event['progress_state'].get('pages_loaded', 0)}/"
-                        f"{event['progress_state'].get('pages_total', 0)}"
-                    )
+                    state["current_progress"] = event["progress_state"]
+                    snapshot = event["progress_state"]
+                    current_label, current_stage, phase, current_count, total_count = describe_selfhosted_progress(snapshot)
                     state["log_lines"].append(
-                        f"[{event['index']}/{len(paths)}] 页面加载 {event['progress_state'].get('pages_loaded', 0)}/{event['progress_state'].get('pages_total', 0)}"
+                        f"[{event['index']}/{len(paths)}] 页面加载 {snapshot.get('pages_loaded', 0)}/{snapshot.get('pages_total', 0)}"
                     )
+                    if current_count == 1 or current_count % 25 == 0 or current_count == total_count:
+                        current_file_units = float(workload[event["index"] - 1][1])
+                        progress_percent = compute_selfhosted_file_fraction(snapshot) * 100.0
+                        remaining_seconds = estimate_selfhosted_eta_seconds(
+                            snapshot,
+                            current_file_units,
+                            total_units,
+                            completed_units,
+                            task_started_at,
+                        )
+                        stage_text = progress_stage_text(snapshot, phase)
+                        append_runtime_log(
+                            "INFO",
+                            "progress",
+                            state=state,
+                            task_id=task_id,
+                            phase=phase,
+                            current=f"{current_count}",
+                            total=f"{total_count}",
+                            percent=f"{progress_percent:.1f}%",
+                            stage=stage_text,
+                            remaining=format_remaining_time(remaining_seconds),
+                        )
                 elif event["type"] == "layout_batch_done":
                     state["active_progress"][event["index"]] = event["progress_state"]
-                    current_label = (
-                        f"版面分析 {event['progress_state'].get('layout_pages_done', 0)}/"
-                        f"{event['progress_state'].get('pages_total', 0)}"
+                    state["current_progress"] = event["progress_state"]
+                    snapshot = event["progress_state"]
+                    current_label, current_stage, phase, current_count, total_count = describe_selfhosted_progress(snapshot)
+                    state["log_lines"].append(
+                        f"[{event['index']}/{len(paths)}] 版面分析完成批次：页 {snapshot.get('layout_pages_done', 0)}/{snapshot.get('pages_total', 0)}，regions={snapshot.get('regions_total', 0)}"
+                    )
+                    if current_count > 0:
+                        current_file_units = float(workload[event["index"] - 1][1])
+                        progress_percent = (current_count / max(1, total_count)) * 100.0
+                        remaining_seconds = estimate_selfhosted_eta_seconds(
+                            snapshot,
+                            current_file_units,
+                            total_units,
+                            completed_units,
+                            task_started_at,
+                        )
+                        append_runtime_log(
+                            "INFO",
+                            "progress",
+                            state=state,
+                            task_id=task_id,
+                            phase=phase,
+                            current=f"{current_count}",
+                            total=f"{total_count}",
+                            percent=f"{progress_percent:.1f}%",
+                            stage=current_stage.replace("当前阶段：", ""),
+                            remaining=format_remaining_time(remaining_seconds),
+                        )
+                elif event["type"] == "page_region_metrics":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    state["current_progress"] = event["progress_state"]
+                    append_runtime_log(
+                        "INFO",
+                        "page metrics",
+                        state=state,
+                        task_id=task_id,
+                        page=event.get("page"),
+                        regions=event.get("regions"),
                     )
                     state["log_lines"].append(
-                        f"[{event['index']}/{len(paths)}] 版面分析完成批次：页 {event['progress_state'].get('layout_pages_done', 0)}/{event['progress_state'].get('pages_total', 0)}，regions={event['progress_state'].get('regions_total', 0)}"
+                        f"[{event['index']}/{len(paths)}] 第 {event.get('page')} 页拆分 {event.get('regions')} 个 region"
                     )
                 elif event["type"] == "region_done":
                     state["active_progress"][event["index"]] = event["progress_state"]
-                    regions_done = event["progress_state"].get("regions_done", 0)
-                    regions_total = event["progress_state"].get("regions_total", 0)
-                    current_label = f"OCR 识别 {regions_done}/{max(regions_total, regions_done)}"
+                    state["current_progress"] = event["progress_state"]
+                elif event["type"] == "page_done":
+                    state["active_progress"][event["index"]] = event["progress_state"]
+                    state["current_progress"] = event["progress_state"]
+                    snapshot = event["progress_state"]
+                    current_label, current_stage, phase, current_count, total_count = describe_selfhosted_progress(snapshot)
+                    state["log_lines"].append(
+                        f"[{event['index']}/{len(paths)}] 页面完成 {current_count}/{total_count}"
+                    )
+                    current_file_units = float(workload[event["index"] - 1][1])
+                    progress_percent = (current_count / max(1, total_count)) * 100.0
+                    remaining_seconds = estimate_selfhosted_eta_seconds(
+                        snapshot,
+                        current_file_units,
+                        total_units,
+                        completed_units,
+                        task_started_at,
+                    )
+                    append_runtime_log(
+                        "INFO",
+                        "progress",
+                        state=state,
+                        task_id=task_id,
+                        phase=phase,
+                        current=f"{current_count}",
+                        total=f"{total_count}",
+                        percent=f"{progress_percent:.1f}%",
+                        stage=current_stage.replace("当前阶段：", ""),
+                        remaining=format_remaining_time(remaining_seconds),
+                    )
                 elif event["type"] == "parse_done":
                     state["active_progress"][event["index"]] = event["progress_state"]
-                    current_label = "解析完成，正在保存"
+                    state["current_progress"] = event["progress_state"]
+                    current_label, current_stage, phase, current_count, total_count = describe_selfhosted_progress(event["progress_state"])
                     state["log_lines"].append(f"[{event['index']}/{len(paths)}] 解析完成，开始保存输出")
+                    current_file_units = float(workload[event["index"] - 1][1])
+                    progress_percent = (current_count / max(1, total_count)) * 100.0
+                    remaining_seconds = estimate_selfhosted_eta_seconds(
+                        event["progress_state"],
+                        current_file_units,
+                        total_units,
+                        completed_units,
+                        task_started_at,
+                    )
+                    stage_text = progress_stage_text(event["progress_state"], phase)
+                    append_runtime_log(
+                        "INFO",
+                        "progress",
+                        state=state,
+                        task_id=task_id,
+                        phase=phase,
+                        current=f"{current_count}",
+                        total=f"{total_count}",
+                        percent=f"{progress_percent:.1f}%",
+                        stage=current_stage.replace("当前阶段：", ""),
+                        remaining=format_remaining_time(remaining_seconds),
+                    )
                 elif event["type"] == "save_done":
                     state["active_progress"][event["index"]] = event["progress_state"]
-                    current_label = "保存完成"
+                    state["current_progress"] = event["progress_state"]
+                    current_label, current_stage, phase, current_count, total_count = describe_selfhosted_progress(event["progress_state"])
                     state["log_lines"].append(f"[{event['index']}/{len(paths)}] 保存完成")
+                    append_runtime_log(
+                        "INFO",
+                        "progress",
+                        state=state,
+                        task_id=task_id,
+                        phase=phase,
+                        current=f"{current_count}",
+                        total=f"{total_count}",
+                        percent="100.0%",
+                        stage="当前阶段：已完成",
+                        remaining="剩余时间：0 秒",
+                    )
                 elif event["type"] == "file_done":
                     completed_units += workload[event["index"] - 1][1]
                     state["active_progress"].pop(event["index"], None)
-                    current_label = f"完成 {event['index']}/{event['total']}"
+                    state["current_progress"] = None
+                    state["current_file_index"] = None
+                    current_label = f"当前进度：已完成 {event['index']}/{event['total']} 项"
+                    current_stage = "当前阶段：等待下一个任务"
                 elif event["type"] == "done":
                     pass
 
@@ -849,15 +2772,29 @@ def run_ocr(
                 eta_seconds = total_units * heuristic_per_unit
 
             if not state["done"]:
-                if mode == "selfhosted" and state["active_progress"]:
-                    current_units_progress = 0.0
-                    for file_index, progress_state in state["active_progress"].items():
-                        file_units = workload[file_index - 1][1]
-                        current_units_progress += file_units * compute_selfhosted_file_fraction(progress_state)
-                    display_percent = ((completed_units + current_units_progress) / total_units) * 100.0
+                if mode == "selfhosted" and state["current_progress"] is not None:
+                    snapshot = snapshot_progress_state(state["current_progress"])
+                    current_file_index = state["current_file_index"]
+                    current_file_units = (
+                        float(workload[current_file_index - 1][1])
+                        if current_file_index is not None and 0 < current_file_index <= len(workload)
+                        else 0.0
+                    )
+                    current_pages, current_total_pages = describe_selfhosted_page_counts(snapshot)
+                    display_percent = (
+                        (completed_units + float(current_pages)) / total_units
+                    ) * 100.0
                     if state["saved_count"] < len(paths):
                         display_percent = min(display_percent, 99.0)
-                    eta_text = format_eta(eta_seconds if completed_units > 0 else None)
+                    eta_seconds = estimate_selfhosted_eta_seconds(
+                        snapshot,
+                        current_file_units,
+                        total_units,
+                        completed_units,
+                        task_started_at,
+                    )
+                    current_stage = progress_stage_text(snapshot, str(snapshot.get("phase") or "preparing"))
+                    eta_text = format_remaining_time(eta_seconds)
                 else:
                     smoothing_target = completed_units
                     if completed_units < total_units:
@@ -866,8 +2803,9 @@ def run_ocr(
                     display_percent = (smoothing_target / total_units) * 100.0
                     if state["saved_count"] < len(paths):
                         display_percent = min(display_percent, 99.0)
-                    eta_text = format_eta(eta_seconds)
-                progress_html = render_progress(current_label, display_percent, eta_text)
+                    current_stage = "当前阶段：正在处理任务"
+                    eta_text = format_remaining_time(eta_seconds)
+                progress_html = render_progress(current_label, display_percent, eta_text, current_stage)
                 summary_text = "\n\n" + ("\n" + ("-" * 60) + "\n\n").join(state["summaries"]) if state["summaries"] else ""
                 markdown_text = "\n\n".join(state["markdown_parts"])
                 json_text = json.dumps(state["json_payloads"], ensure_ascii=False, indent=2)
@@ -883,7 +2821,7 @@ def run_ocr(
                 )
                 break
 
-            progress_html = render_progress("完成", 100.0, "预计剩余时间: 0 秒")
+            progress_html = render_progress("当前进度：已完成", 100.0, "剩余时间：0 秒", "当前阶段：已完成")
             summary_text = "\n\n" + ("\n" + ("-" * 60) + "\n\n").join(state["summaries"]) if state["summaries"] else ""
             markdown_text = "\n\n".join(state["markdown_parts"])
             json_text = json.dumps(state["json_payloads"], ensure_ascii=False, indent=2)
@@ -991,6 +2929,11 @@ def build_app() -> gr.Blocks:
       font-variant-numeric: tabular-nums;
       color: inherit;
     }
+    .status-stage {
+      margin-bottom: 8px;
+      font-size: 12px;
+      opacity: 0.82;
+    }
     .status-meter {
       width: 100%;
       height: 12px;
@@ -1045,7 +2988,12 @@ def build_app() -> gr.Blocks:
                     )
                     backend_status = gr.Textbox(label="后端状态", lines=7, value="后端: selfhosted\n状态: 初始化中", elem_classes=["surface-card"])
                     progress_html = gr.HTML(
-                        value=render_progress("就绪", 0.0, "预计剩余时间: 计算中")
+                        value=render_progress(
+                            "当前进度：等待任务开始",
+                            0.0,
+                            "剩余时间：计算中",
+                            "当前阶段：准备解析任务",
+                        )
                     )
                     files = gr.Files(
                         label="上传图片或 PDF",

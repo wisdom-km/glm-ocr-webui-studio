@@ -5,6 +5,7 @@ __pycache__/
 *.log
 
 # Local outputs and caches
+glm_ocr_inputs/
 glm_ocr_outputs/
 glm_ocr_outputs_web/
 hf-cache/
